@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Lukáš Hornych
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: test/docker
+          file: test/docker/Dockerfile
+          tags: fdwam-test
+          load: true
+          cache-from: type=gha,scope=full
+          cache-to: type=gha,scope=full,mode=max
+      - run: make lint NO_BUILD=1
+
+  release-config:
+    name: Release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Catches a broken `make dist` here rather than on a push to main, where it would fail after
+      # the release notes have already been published.
+      - name: Release assets build
+        run: |
+          make dist VERSION=v0.0.0-ci
+          ./dist/fdwam version | grep -q '^fdwam 0.0.0-ci, Apache-2.0$'
+          (cd dist && sha256sum -c SHA256SUMS)
+      - name: Installer syntax
+        run: bash -n install.sh
+
+  test:
+    name: Test (full image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: test/docker
+          file: test/docker/Dockerfile
+          tags: fdwam-test
+          load: true
+          cache-from: type=gha,scope=full
+          cache-to: type=gha,scope=full,mode=max
+      - run: make test NO_BUILD=1
+
+  test-minimal:
+    name: Test (minimal image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: test/docker
+          file: test/docker/Dockerfile.minimal
+          tags: fdwam-test-minimal
+          load: true
+          cache-from: type=gha,scope=minimal
+          cache-to: type=gha,scope=minimal,mode=max
+      - run: make test-minimal NO_BUILD=1
+
+  # Optional: other distributions. Only detection, .desktop validation and the offline tests
+  # matter here; results are "CI only" in the README.
+  distros:
+    name: Test (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: fedora:latest
+            setup: dnf install -y bash coreutils curl desktop-file-utils glib2 ImageMagick file jq python3 util-linux util-linux-script
+          - image: archlinux:latest
+            setup: pacman -Sy --noconfirm bash coreutils curl desktop-file-utils glib2 imagemagick file jq python util-linux
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - name: Run tests in ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ${{ matrix.image }} bash -c '
+            set -e
+            ${{ matrix.setup }} >/dev/null
+            useradd -m tester
+            chown -R tester /tmp
+            su tester -c "HOME=/home/tester ./test/bats/bin/bats test/cli.bats test/browsers.bats test/registry.bats test/desktop.bats test/profiles.bats test/commands.bats"
+          '

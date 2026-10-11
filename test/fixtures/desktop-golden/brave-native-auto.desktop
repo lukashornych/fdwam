@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Netflix
+Comment=Web app: https://www.netflix.com/
+Exec=@BIN@/brave --user-data-dir=@DATA@/fdwam/profiles/netflix --profile-directory=fdwam-netflix --no-first-run --no-default-browser-check --ozone-platform-hint=auto --app=https://www.netflix.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=brave-www.netflix.com__-fdwam-netflix
+Categories=Network;
+X-Fdwam-Id=netflix
+X-Fdwam-Browser=brave

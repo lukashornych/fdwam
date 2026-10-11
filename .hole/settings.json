@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/lukashornych/hole/main/assets/schema/settings.schema.json",
+  "network": {
+    "allow": [
+      "archive.ubuntu.com",
+      "security.ubuntu.com",
+      "ports.ubuntu.com"
+    ]
+  }
+}

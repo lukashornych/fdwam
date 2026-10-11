@@ -1,0 +1,15 @@
+fdwam – freedesktop web app manager
+Copyright 2026 Lukáš Hornych
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+fdwam is not an official freedesktop.org project and is not affiliated with
+freedesktop.org. It implements the Desktop Entry Specification and the XDG Base
+Directory Specification published there.
+
+Acknowledgements:
+  * linuxmint/webapp-manager (GPL-3.0) served as the inspiration for the
+    isolated-profile approach and for the list of browser binaries and flatpak
+    IDs. No code from it is included in this project.
+  * bats-core, bats-support and bats-assert (MIT) are used as development
+    dependencies (git submodules) for the test suite only.

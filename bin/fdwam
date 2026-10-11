@@ -1,0 +1,2498 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Lukáš Hornych
+#
+# fdwam – freedesktop web app manager
+#
+# Creates "web apps": a .desktop launcher (Desktop Entry Specification 1.5) that
+# starts a browser in app mode with an isolated profile, plus the site's favicon
+# as the launcher icon. Pure Bash, no GUI.
+#
+# Sections (in order): constants, logging, util, config, browser detection,
+# registry, icons, profiles, desktop entry, commands, wizard, main.
+#
+# The script can be sourced by tests: the entry point at the bottom is guarded
+# by [[ "${BASH_SOURCE[0]}" == "$0" ]].
+
+# Strict mode only when executed directly. When sourced (tests) the host shell
+# keeps its own settings and traps.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -Eeuo pipefail
+  shopt -s extglob nullglob inherit_errexit
+fi
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  printf 'fdwam: bash >= 4.4 is required (found %s)\n' "$BASH_VERSION" >&2
+  exit 1
+fi
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Everything (command name, directories, X-* keys, ENV variables) is derived
+# from this single constant.
+readonly TOOL="fdwam"
+readonly TOOL_UPPER="${TOOL^^}"          # FDWAM  (ENV prefix)
+readonly X_KEY_PREFIX="X-${TOOL^}"       # X-Fdwam (.desktop keys)
+# "development" in the repository. The release workflow (.github/workflows/release.yml)
+# stamps the resolved tag into the released copy via `make dist VERSION=vX.Y.Z`.
+readonly FDWAM_VERSION="development"
+readonly FDWAM_LICENSE="Apache-2.0"
+readonly REGISTRY_FORMAT_VERSION="1"
+readonly USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 ${TOOL}/${FDWAM_VERSION}"
+
+# Exit codes
+readonly EX_ERROR=1
+readonly EX_USAGE=2
+readonly EX_NOT_FOUND=3
+readonly EX_NO_BROWSER=4
+
+# Reads an ENV variable named ${TOOL_UPPER}_<suffix>, falling back to a default.
+# Usage: tool_env SUFFIX DEFAULT
+tool_env() {
+  local var="${TOOL_UPPER}_$1"
+  printf '%s' "${!var:-$2}"
+}
+
+# XDG paths
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_DIR="$XDG_DATA_HOME/$TOOL"
+REG_DIR="$DATA_DIR/apps"
+ICON_DIR="$DATA_DIR/icons"
+PROFILES_DIR="$DATA_DIR/profiles"
+DESKTOP_DIR="$XDG_DATA_HOME/applications"
+CONFIG_FILE="$XDG_CONFIG_HOME/$TOOL/config"
+
+# Sandbox roots. Configurable so that tests can point them to fake directories.
+SNAP_BIN_DIR="$(tool_env SNAP_BIN_DIR /snap/bin)"
+SNAP_PREFIX="$(tool_env SNAP_PREFIX /snap/)"
+FLATPAK_SYSTEM_DIR="$(tool_env FLATPAK_SYSTEM_DIR /var/lib/flatpak/exports/bin)"
+FLATPAK_USER_DIR="$(tool_env FLATPAK_USER_DIR "$XDG_DATA_HOME/flatpak/exports/bin")"
+
+# Main freedesktop menu categories offered by the wizard.
+declare -gra MAIN_CATEGORIES=(AudioVideo Development Education Game Graphics Network Office Science Settings System Utility)
+declare -gra OZONE_MODES=(auto wayland x11)
+
+VERBOSE=0
+ASSUME_YES=0
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+_color() {
+  # Colors only when stderr is a terminal and NO_COLOR is not set.
+  [[ -t 2 && -z "${NO_COLOR:-}" ]] || return 0
+  printf '\033[%sm' "$1"
+}
+
+# Result messages for the user (stdout).
+say() { printf '%s\n' "$*"; }
+# Progress/info messages (stderr), never part of machine-readable output.
+log_info() { printf '%s\n' "$*" >&2; }
+log_warn() { printf '%s%s: warning:%s %s\n' "$(_color '1;33')" "$TOOL" "$(_color 0)" "$*" >&2; }
+log_error() { printf '%s%s: error:%s %s\n' "$(_color '1;31')" "$TOOL" "$(_color 0)" "$*" >&2; }
+log_debug() { (( VERBOSE )) && printf '%s: debug: %s\n' "$TOOL" "$*" >&2; return 0; }
+
+# Prints an error and exits. Usage: die <exit-code> <message...>
+die() {
+  local code="$1"; shift
+  log_error "$*"
+  exit "$code"
+}
+
+# =============================================================================
+# Util
+# =============================================================================
+
+TMP_ROOT=""
+CREATE_IN_PROGRESS=0
+ROLLBACK_PATHS=()
+
+# Lazily creates the private temp directory of this run in TMP_ROOT. Must be
+# called in the main shell (not inside $(...)), otherwise the path is lost and
+# the directory leaks.
+ensure_tmp() {
+  if [[ -z "$TMP_ROOT" ]]; then
+    TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/${TOOL}.XXXXXX")"
+  fi
+}
+
+# Removes the private temp directory of this run (if any).
+cleanup_tmp() {
+  [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" ]] && rm -rf -- "$TMP_ROOT"
+  TMP_ROOT=""
+}
+
+on_exit() {
+  local rc=$?
+  if (( rc != 0 )) && (( CREATE_IN_PROGRESS )); then
+    rollback_created
+  fi
+  cleanup_tmp
+  return 0
+}
+on_interrupt() {
+  log_info ""
+  log_info "aborted"
+  exit 130
+}
+# Installed by main(); a sourced script must not replace the caller's traps.
+install_traps() {
+  trap on_exit EXIT
+  trap on_interrupt INT TERM
+}
+
+# Removes everything that an unfinished `create` wrote so far (profile, icon,
+# registry, .desktop). Called from the EXIT trap on failure.
+rollback_created() {
+  local p warned=0
+  for p in "${ROLLBACK_PATHS[@]}"; do
+    [[ -e "$p" || -L "$p" ]] || continue
+    (( warned++ )) || log_warn "rolling back partially created app"
+    log_debug "rollback: removing $p"
+    rm -rf -- "$p"
+  done
+  ROLLBACK_PATHS=()
+}
+
+has_cmd() { command -v -- "$1" >/dev/null 2>&1; }
+
+lower() { printf '%s' "${1,,}"; }
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Removes control characters (incl. newlines) from a value.
+sanitize_line() {
+  printf '%s' "$1" | tr -d '\000-\037\177'
+}
+
+# Atomically writes stdin to a file (temp file in the same directory + mv).
+atomic_write() {
+  local target="$1" dir tmp
+  dir="$(dirname -- "$target")"
+  mkdir -p -- "$dir"
+  tmp="$(mktemp "$dir/.${TOOL}.XXXXXX")" || die "$EX_ERROR" "cannot create a temporary file in $dir"
+  cat > "$tmp" || { rm -f -- "$tmp"; die "$EX_ERROR" "cannot write $target"; }
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; die "$EX_ERROR" "cannot replace $target"; }
+}
+
+# Returns 0 when both stdin and stdout are terminals (or the test hook forces it).
+is_interactive() {
+  [[ "$(tool_env FORCE_INTERACTIVE 0)" == 1 ]] && return 0
+  [[ -t 0 && -t 1 ]]
+}
+
+# Returns 0 if `value` is one of the remaining arguments (case-sensitive).
+in_list() {
+  local value="$1" x; shift
+  for x in "$@"; do [[ "$x" == "$value" ]] && return 0; done
+  return 1
+}
+
+# Case-insensitive variant of in_list that prints the canonical spelling.
+match_list() {
+  local value x
+  value="$(lower "$1")"; shift
+  for x in "$@"; do
+    if [[ "$(lower "$x")" == "$value" ]]; then printf '%s' "$x"; return 0; fi
+  done
+  return 1
+}
+
+# Capitalizes the first letter of each '-'-separated word: "mail-google" -> "Mail Google".
+titleize() {
+  local out="" w
+  for w in ${1//-/ }; do out+="${w^} "; done
+  printf '%s' "${out% }"
+}
+
+# --- URL helpers -------------------------------------------------------------
+
+# Normalizes a user supplied URL: adds https:// when the scheme is missing and
+# lower-cases scheme and host. Prints the result; returns 1 for unsupported URLs.
+url_normalize() {
+  local url scheme rest host_port path
+  url="$(trim "$1")"
+  [[ -n "$url" ]] || return 1
+  if [[ "$url" != *://* ]]; then
+    url="https://$url"
+  fi
+  scheme="${url%%://*}"
+  scheme="$(lower "$scheme")"
+  [[ "$scheme" == http || "$scheme" == https ]] || return 1
+  rest="${url#*://}"
+  host_port="${rest%%[/?#]*}"
+  path="${rest:${#host_port}}"
+  [[ -n "$host_port" ]] || return 1
+  [[ "$host_port" =~ ^[A-Za-z0-9._~%-]+(:[0-9]+)?$ ]] || return 1
+  [[ "$host_port" == *[[:space:]]* ]] && return 1
+  host_port="$(lower "$host_port")"
+  [[ -z "$path" ]] && path="/"
+  [[ "$path" == [?#]* ]] && path="/$path"
+  url="$scheme://$host_port$path"
+  # Control characters (newline, tab, CR, NUL, DEL) would break the .desktop file.
+  [[ "$url" == *[[:cntrl:]]* ]] && return 1
+  printf '%s' "$url"
+}
+
+# Prints the host (without port) of a URL.
+url_host() {
+  local rest="${1#*://}"
+  rest="${rest%%[/?#]*}"
+  printf '%s' "${rest%%:*}"
+}
+
+# Prints the path of a URL without query string and fragment ("/" when empty).
+url_path() {
+  local rest="${1#*://}" path
+  path="${rest#"${rest%%[/?#]*}"}"
+  path="${path%%[?#]*}"
+  [[ -z "$path" ]] && path="/"
+  printf '%s' "$path"
+}
+
+# Prints scheme://host[:port] of a URL.
+url_origin() {
+  local rest="${1#*://}"
+  printf '%s://%s' "${1%%://*}" "${rest%%[/?#]*}"
+}
+
+# Resolves a (possibly relative) reference against a base URL. Prints the result.
+url_resolve() {
+  local base="$1" ref="$2" origin dir
+  ref="$(trim "$ref")"
+  case "$ref" in
+    *://*) printf '%s' "$ref" ;;
+    //*)   printf '%s:%s' "${base%%://*}" "$ref" ;;
+    /*)    printf '%s%s' "$(url_origin "$base")" "$ref" ;;
+    "")    printf '%s' "$base" ;;
+    *)
+      origin="$(url_origin "$base")"
+      dir="$(url_path "$base")"
+      dir="${dir%/*}/"
+      printf '%s%s%s' "$origin" "$dir" "$ref"
+      ;;
+  esac
+}
+
+# Minimal HTML entity decoding for titles. (sed instead of ${var//a/b}: since
+# bash 5.2 '&' in a pattern-substitution replacement means "the match".)
+html_unescape() {
+  printf '%s' "$1" | sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' \
+    -e "s/&#39;/'/g" -e "s/&#x27;/'/g" -e "s/&apos;/'/g" -e 's/&nbsp;/ /g' -e 's/&amp;/\&/g'
+}
+
+# =============================================================================
+# Config  (${XDG_CONFIG_HOME}/fdwam/config, key=value, never sourced)
+# =============================================================================
+
+declare -gA CFG=()
+
+# Loads the config file into the CFG associative array. Unknown lines are ignored.
+config_load() {
+  CFG=()
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*([a-z_][a-z0-9_.-]*)[[:space:]]*=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="$(trim "${BASH_REMATCH[2]}")"
+    CFG["$key"]="$value"
+  done < "$CONFIG_FILE"
+}
+
+# Prints a config value or the default. Usage: config_get KEY [DEFAULT]
+config_get() {
+  if [[ -v "CFG[$1]" ]]; then printf '%s' "${CFG[$1]}"; else printf '%s' "${2:-}"; fi
+}
+
+# =============================================================================
+# Browser detection
+# =============================================================================
+#
+# Candidate table. Order inside BROWSER_ENUM is the order used when picking a
+# default browser (primary first). Support: P = primary (tested), S = secondary
+# (best effort). BROWSER_VERIFIED holds the environment in which the browser was
+# manually verified; empty means the wm_class rule is ESTIMATED.
+
+declare -gra BROWSER_ENUM=(brave chrome chromium firefox vivaldi edge librewolf floorp waterfox zen epiphany falkon)
+
+declare -grA BROWSER_FAMILY=(
+  [brave]=chromium [chrome]=chromium [chromium]=chromium [vivaldi]=chromium [edge]=chromium
+  [firefox]=firefox [librewolf]=firefox [floorp]=firefox [waterfox]=firefox [zen]=firefox
+  [epiphany]=epiphany [falkon]=falkon
+)
+declare -grA BROWSER_SUPPORT=(
+  [brave]=primary [chrome]=primary [chromium]=primary [firefox]=primary
+  [vivaldi]=secondary [edge]=secondary [librewolf]=secondary [floorp]=secondary
+  [waterfox]=secondary [zen]=secondary [epiphany]=secondary [falkon]=secondary
+)
+declare -grA BROWSER_NATIVE=(
+  [brave]="brave brave-browser brave-browser-stable brave-bin"
+  [chrome]="google-chrome-stable google-chrome google-chrome-beta google-chrome-unstable"
+  [chromium]="chromium chromium-browser ungoogled-chromium chromium-bin-browser"
+  [vivaldi]="vivaldi-stable vivaldi vivaldi-snapshot"
+  [edge]="microsoft-edge-stable microsoft-edge microsoft-edge-beta microsoft-edge-dev"
+  [firefox]="firefox firefox-esr"
+  [librewolf]="librewolf"
+  [floorp]="floorp"
+  [waterfox]="waterfox waterfox-current waterfox-g4"
+  [zen]="zen-browser zen"
+  [epiphany]="epiphany epiphany-browser"
+  [falkon]="falkon"
+)
+declare -grA BROWSER_SNAP=(
+  [brave]=brave [chromium]=chromium [vivaldi]=vivaldi [firefox]=firefox
+)
+declare -grA BROWSER_FLATPAK=(
+  [brave]="com.brave.Browser"
+  [chrome]="com.google.Chrome"
+  [chromium]="org.chromium.Chromium io.github.ungoogled_software.ungoogled_chromium"
+  [vivaldi]="com.vivaldi.Vivaldi"
+  [edge]="com.microsoft.Edge"
+  [firefox]="org.mozilla.firefox"
+  [librewolf]="io.gitlab.librewolf-community"
+  [floorp]="one.ablaze.floorp"
+  [waterfox]="net.waterfox.waterfox"
+  [zen]="app.zen_browser.zen"
+  [epiphany]="org.gnome.Epiphany"
+  [falkon]="org.kde.falkon"
+)
+# Wayland app_id prefix of the chromium family. Only `brave` is verified
+# (docs/research-wayland.md); the others are ESTIMATED from Chromium's code base.
+declare -grA BROWSER_PREFIX=(
+  [brave]=brave [chrome]=chrome [chromium]=chromium [vivaldi]=vivaldi [edge]=msedge
+)
+declare -grA BROWSER_VERIFIED=(
+  [brave]="KDE Neon, Plasma 6.6.6, Wayland, Brave 155 snap, 2026-10-11"
+  [firefox]="KDE Neon, Plasma 6.6.6, Wayland, Firefox 154.0 snap, 2026-10-11"
+)
+
+# Result of browser_resolve.
+BR_ENUM="" BR_FAMILY="" BR_SUPPORT="" BR_KIND="" BR_EXEC="" BR_SNAP_NAME="" BR_FLATPAK_ID="" BR_PREFIX=""
+
+browser_is_enum() { [[ -v "BROWSER_FAMILY[$1]" ]]; }
+
+is_shell_script() {
+  local first
+  IFS= read -r first < "$1" 2>/dev/null || return 1
+  [[ "$first" == '#!'*sh* ]]
+}
+
+# Derives the snap name from a command: /snap/bin/<snap> or
+# /snap/bin/<snap>.<app>. The symlink chain is followed one hop at a time (max
+# 16 hops, relative targets resolved against the link's directory), e.g.
+# /usr/bin/brave-browser -> /etc/alternatives/brave-browser -> /snap/bin/brave
+# -> /usr/bin/snap. The last link inside SNAP_BIN_DIR wins, so aliases (a link
+# to another command in the same dir) use the target name. Without such a link
+# the basename of the last link that is not the `snap` launcher is used.
+snap_name_from_bin() {
+  local path="$1" base="" fallback target hops=0
+  fallback="$(basename -- "$path")"
+  while :; do
+    if [[ "$path" == "${SNAP_BIN_DIR%/}"/* ]]; then
+      base="$(basename -- "$path")"
+    elif [[ "$(basename -- "$path")" != snap ]]; then
+      fallback="$(basename -- "$path")"
+    fi
+    target="$(readlink -- "$path" 2>/dev/null)" || break
+    (( ++hops <= 16 )) || break
+    [[ "$target" == /* ]] || target="$(dirname -- "$path")/$target"
+    path="$target"
+  done
+  [[ -n "$base" ]] || base="$fallback"
+  printf '%s' "${base%%.*}"
+}
+
+# Classifies an executable as native or snap (shim detection) and sets
+# BR_KIND and BR_SNAP_NAME. BR_EXEC keeps the UNRESOLVED path.
+# Usage: browser_classify_exec <path>
+browser_classify_exec() {
+  local path="$1" resolved rest hit
+  BR_KIND=native
+  BR_SNAP_NAME=""
+  resolved="$(readlink -f -- "$path" 2>/dev/null || printf '%s' "$path")"
+  if [[ "$path" == "${SNAP_BIN_DIR%/}"/* ]]; then
+    BR_KIND=snap
+    BR_SNAP_NAME="$(snap_name_from_bin "$path")"
+  elif [[ "$resolved" == "$SNAP_PREFIX"* ]]; then
+    BR_KIND=snap
+    rest="${resolved#"$SNAP_PREFIX"}"
+    if [[ "$rest" == bin/* ]]; then
+      BR_SNAP_NAME="$(snap_name_from_bin "$path")"
+    else
+      BR_SNAP_NAME="${rest%%/*}"
+    fi
+  elif [[ "$(basename -- "$resolved")" == snap ]]; then
+    # e.g. /usr/bin/brave-browser -> /snap/bin/brave -> /usr/bin/snap
+    BR_KIND=snap
+    BR_SNAP_NAME="$(snap_name_from_bin "$path")"
+  elif is_shell_script "$path" && grep -q -- "${SNAP_BIN_DIR%/}/" "$path" 2>/dev/null; then
+    # Ubuntu transitional shims (/usr/bin/chromium-browser, /usr/bin/firefox).
+    BR_KIND=snap
+    hit="$(grep -o -m1 -- "${SNAP_BIN_DIR%/}/[A-Za-z0-9_.+-]*" "$path" | head -n1)"
+    BR_SNAP_NAME="$(snap_name_from_bin "$hit")"
+  fi
+  if [[ "$BR_KIND" == snap && -z "$BR_SNAP_NAME" ]]; then
+    BR_SNAP_NAME="${BROWSER_SNAP[$BR_ENUM]:-$(basename -- "$path")}"
+  fi
+}
+
+# Resolves a browser enum value to a concrete installation.
+# Order: override (ENV ${TOOL_UPPER}_BROWSER_<ENUM> / config browser.<enum>) ->
+# native binaries in PATH -> snap -> flatpak (system, then user).
+# Sets BR_* globals. Returns 0 when found, EX_NO_BROWSER otherwise (and logs why).
+# Usage: browser_resolve <enum>
+browser_resolve() {
+  local enum="$1" override cand path dir fid var
+  browser_is_enum "$enum" || { log_error "unknown browser '$enum' (expected one of: ${BROWSER_ENUM[*]})"; return "$EX_USAGE"; }
+  BR_ENUM="$enum"
+  BR_FAMILY="${BROWSER_FAMILY[$enum]}"
+  BR_SUPPORT="${BROWSER_SUPPORT[$enum]}"
+  BR_PREFIX="${BROWSER_PREFIX[$enum]:-$enum}"
+  BR_KIND="" BR_EXEC="" BR_SNAP_NAME="" BR_FLATPAK_ID=""
+
+  # 1. override
+  var="${TOOL_UPPER}_BROWSER_${enum^^}"
+  override="${!var:-}"
+  [[ -n "$override" ]] || override="$(config_get "browser.$enum")"
+  if [[ -n "$override" ]]; then
+    if [[ "$override" != */* ]]; then
+      path="$(type -P -- "$override" || true)"
+    else
+      path="$override"
+    fi
+    if [[ -z "$path" || ! -x "$path" ]]; then
+      log_error "browser override for '$enum' is not executable: $override"
+      return "$EX_NO_BROWSER"
+    fi
+    browser_classify_exec "$path"
+    BR_EXEC="$path"
+    if [[ "$(basename -- "$path")" == flatpak || "$path" == */exports/bin/* ]]; then
+      BR_KIND=flatpak
+      BR_FLATPAK_ID="$(basename -- "$path")"
+    fi
+    log_debug "browser $enum: override $BR_EXEC ($BR_KIND)"
+    return 0
+  fi
+
+  # 2. native binaries in PATH (may turn out to be snap shims)
+  for cand in ${BROWSER_NATIVE[$enum]}; do
+    path="$(type -P -- "$cand" || true)"
+    [[ -n "$path" ]] || continue
+    browser_classify_exec "$path"
+    BR_EXEC="$path"
+    log_debug "browser $enum: found $BR_EXEC ($BR_KIND)"
+    return 0
+  done
+
+  # 3. snap
+  if [[ -v "BROWSER_SNAP[$enum]" ]]; then
+    path="${SNAP_BIN_DIR%/}/${BROWSER_SNAP[$enum]}"
+    if [[ -x "$path" ]]; then
+      BR_KIND=snap
+      BR_SNAP_NAME="${BROWSER_SNAP[$enum]}"
+      BR_EXEC="$path"
+      log_debug "browser $enum: snap $BR_EXEC"
+      return 0
+    fi
+  fi
+
+  # 4. flatpak (system, then user)
+  for fid in ${BROWSER_FLATPAK[$enum]:-}; do
+    for dir in "$FLATPAK_SYSTEM_DIR" "$FLATPAK_USER_DIR"; do
+      path="${dir%/}/$fid"
+      [[ -x "$path" ]] || continue
+      if [[ "$BR_FAMILY" == epiphany ]]; then
+        log_error "flatpak Epiphany ($fid) is not supported: it creates web apps through the portal and ignores manual profiles. Install the native package."
+        return "$EX_NO_BROWSER"
+      fi
+      BR_KIND=flatpak
+      BR_FLATPAK_ID="$fid"
+      BR_EXEC="$path"
+      log_debug "browser $enum: flatpak $BR_EXEC"
+      return 0
+    done
+  done
+
+  log_error "browser '$enum' not found (searched PATH for: ${BROWSER_NATIVE[$enum]}; snap: ${BROWSER_SNAP[$enum]:-none}; flatpak: ${BROWSER_FLATPAK[$enum]:-none})"
+  return "$EX_NO_BROWSER"
+}
+
+# Picks the default browser: config default_browser, otherwise the first
+# installed browser in BROWSER_ENUM order (primary browsers come first).
+# Sets BR_* globals. Returns EX_NO_BROWSER when nothing is installed.
+browser_default() {
+  local cfg enum
+  cfg="$(config_get default_browser)"
+  if [[ -n "$cfg" ]]; then
+    browser_resolve "$cfg" && return 0
+    return "$EX_NO_BROWSER"
+  fi
+  for enum in "${BROWSER_ENUM[@]}"; do
+    browser_resolve "$enum" 2>/dev/null && return 0
+  done
+  log_error "no supported browser found (looked for: ${BROWSER_ENUM[*]})"
+  return "$EX_NO_BROWSER"
+}
+
+# Lists installed browsers as lines "enum|kind|exec|support" (used by the wizard).
+browsers_installed() {
+  local enum
+  for enum in "${BROWSER_ENUM[@]}"; do
+    browser_resolve "$enum" 2>/dev/null || continue
+    printf '%s|%s|%s|%s\n' "$enum" "$BR_KIND" "$BR_EXEC" "$BR_SUPPORT"
+  done
+}
+
+# =============================================================================
+# Registry  (${XDG_DATA_HOME}/fdwam/apps/<id>.conf, key=value, never sourced)
+# =============================================================================
+
+# Field order of a registry file. `APP` holds the currently loaded app.
+declare -gra REG_FIELDS=(id name url browser browser_kind browser_exec family profile_dir profile_link icon wm_class ozone category flags created modified version)
+declare -gA APP=()
+
+registry_file() { printf '%s/%s.conf' "$REG_DIR" "$1"; }
+
+registry_exists() { [[ -f "$(registry_file "$1")" ]]; }
+
+# Loads apps/<id>.conf into APP. Values are taken literally (no expansion).
+# Returns EX_NOT_FOUND when the app does not exist.
+registry_read() {
+  local id="$1" file line key value
+  file="$(registry_file "$id")"
+  if [[ ! -f "$file" ]]; then
+    log_error "app '$id' not found in $REG_DIR"
+    return "$EX_NOT_FOUND"
+  fi
+  APP=()
+  for key in "${REG_FIELDS[@]}"; do APP["$key"]=""; done
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([a-z_]+)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    APP["$key"]="$value"
+  done < "$file"
+  [[ -n "${APP[id]}" ]] || APP[id]="$id"
+  return 0
+}
+
+# Writes APP to apps/<id>.conf atomically.
+registry_write() {
+  local key file
+  file="$(registry_file "${APP[id]}")"
+  APP[version]="$REGISTRY_FORMAT_VERSION"
+  {
+    for key in "${REG_FIELDS[@]}"; do
+      printf '%s=%s\n' "$key" "$(sanitize_line "${APP[$key]:-}")"
+    done
+  } | atomic_write "$file" || return 1
+  log_debug "registry: wrote $file"
+}
+
+registry_delete() {
+  rm -f -- "$(registry_file "$1")"
+}
+
+# Prints all registered IDs, sorted.
+registry_list() {
+  local f
+  for f in "$REG_DIR"/*.conf; do
+    [[ -f "$f" ]] || continue
+    basename -- "$f" .conf
+  done | LC_ALL=C sort
+}
+
+# Current timestamp (ISO 8601 UTC). ${TOOL_UPPER}_NOW overrides it in tests.
+now_iso() {
+  local fixed
+  fixed="$(tool_env NOW "")"
+  if [[ -n "$fixed" ]]; then printf '%s' "$fixed"; else date -u +%Y-%m-%dT%H:%M:%SZ; fi
+}
+
+# --- IDs ---------------------------------------------------------------------
+
+readonly ID_REGEX='^[a-z0-9][a-z0-9-]{0,39}$'
+
+id_valid() { [[ "$1" =~ $ID_REGEX ]]; }
+
+# Derives a slug from the hostname of a URL: drop a generic "www."/"app."
+# prefix, drop the TLD (and a second-level public suffix such as co.uk), join
+# the rest with '-'.
+# netflix.com -> netflix, app.slack.com -> slack, mail.google.com -> mail-google
+slug_from_url() {
+  local host labels n slug
+  host="$(lower "$(url_host "$1")")"
+  IFS=. read -r -a labels <<< "$host"
+  n=${#labels[@]}
+  if (( n >= 3 )) && in_list "${labels[0]}" www app; then
+    labels=("${labels[@]:1}")
+    n=${#labels[@]}
+  fi
+  if (( n >= 3 )) && [[ ${#labels[n-1]} -eq 2 ]] && in_list "${labels[n-2]}" co com net org gov edu ac; then
+    labels=("${labels[@]:0:n-2}")
+  elif (( n >= 2 )); then
+    labels=("${labels[@]:0:n-1}")
+  fi
+  slug="$(IFS=-; printf '%s' "${labels[*]}")"
+  slug="$(printf '%s' "$slug" | tr -c 'a-z0-9-' '-' | tr -s '-')"
+  slug="${slug##-}"; slug="${slug%%-}"
+  slug="${slug:0:40}"
+  slug="${slug%%-}"
+  [[ -n "$slug" ]] || slug="webapp"
+  printf '%s' "$slug"
+}
+
+# Silent check that an ID is unused: neither a registry entry nor a .desktop
+# file of that name exists. On failure the reason is left in ID_TAKEN_REASON.
+ID_TAKEN_REASON=""
+id_available() {
+  ID_TAKEN_REASON=""
+  if registry_exists "$1"; then
+    ID_TAKEN_REASON="id '$1' already exists"
+  elif [[ -e "$(desktop_file "$1")" || -L "$(desktop_file "$1")" ]]; then
+    ID_TAKEN_REASON="$(desktop_file "$1") already exists"
+  fi
+  [[ -z "$ID_TAKEN_REASON" ]]
+}
+
+# Appends -2, -3, ... until the ID is unused. Prints the resulting ID.
+id_unique() {
+  local base="$1" n=2 candidate="$1"
+  while ! id_available "$candidate"; do
+    candidate="${base:0:$((40 - ${#n} - 1))}-$n"
+    n=$((n + 1))
+  done
+  printf '%s' "$candidate"
+}
+
+# =============================================================================
+# Desktop entry
+# =============================================================================
+
+desktop_file() { printf '%s/%s-%s.desktop' "$DESKTOP_DIR" "$TOOL" "$1"; }
+
+# Returns 0 when a session type looks like X11 (used for the default ozone mode).
+session_is_x11() {
+  local t="${XDG_SESSION_TYPE:-}"
+  if [[ -n "$t" ]]; then [[ "$t" == x11 ]]; return; fi
+  [[ -z "${WAYLAND_DISPLAY:-}" && -n "${DISPLAY:-}" ]]
+}
+
+# Default ozone mode: ${TOOL_UPPER}_OZONE -> config ozone_mode -> session type.
+ozone_default() {
+  local v
+  v="$(tool_env OZONE "")"
+  [[ -n "$v" ]] || v="$(config_get ozone_mode)"
+  if [[ -n "$v" ]]; then
+    in_list "$v" "${OZONE_MODES[@]}" || { log_warn "ignoring invalid ozone mode '$v' (expected: ${OZONE_MODES[*]})"; v=""; }
+  fi
+  if [[ -z "$v" ]]; then
+    if session_is_x11; then v=x11; else v=auto; fi
+  fi
+  printf '%s' "$v"
+}
+
+# Computes the window class / Wayland app_id that the browser will give the
+# app window, i.e. the StartupWMClass of the .desktop file.
+# Usage: compute_wm_class <family> <prefix> <ozone> <url> <id>
+#
+# chromium on Wayland (verified for Brave 155):
+#   <prefix>-<host>_<path with '/' -> '_'>-<profile-directory>
+#   https://www.netflix.com/ + fdwam-netflix -> brave-www.netflix.com__-fdwam-netflix
+#   Port, query and fragment are not part of it (ESTIMATED); host is lower-case.
+# chromium on X11: value of --class (fdwam-<id>).
+# firefox family: value of --name (fdwam-<id>)                      # ESTIMATED
+# epiphany: org.gnome.Epiphany.WebApp_<id>                            # ESTIMATED
+# falkon: value of --wmclass (X11 only; on Wayland Qt uses org.kde.falkon)
+compute_wm_class() {
+  local family="$1" prefix="$2" ozone="$3" url="$4" id="$5" host path
+  case "$family" in
+    chromium)
+      if [[ "$ozone" == x11 ]]; then
+        printf '%s-%s' "$TOOL" "$id"
+      else
+        host="$(lower "$(url_host "$url")")"
+        path="$(url_path "$url")"
+        printf '%s-%s_%s-%s-%s' "$prefix" "$host" "${path//\//_}" "$TOOL" "$id"
+      fi
+      ;;
+    epiphany) printf 'org.gnome.Epiphany.WebApp_%s' "$id" ;;
+    *) printf '%s-%s' "$TOOL" "$id" ;;
+  esac
+}
+
+# Splits a flags string into words, honouring single and double quotes.
+# Appends the words to the array named by $1. Usage: split_flags ARRAY "<string>"
+split_flags() {
+  local -n _out="$1"
+  local s="$2" cur="" i c q="" have=0
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    if [[ -n "$q" ]]; then
+      if [[ "$c" == "$q" ]]; then q=""; else cur+="$c"; fi
+    elif [[ "$c" == \" || "$c" == \' ]]; then
+      q="$c"; have=1
+    elif [[ "$c" == [[:space:]] ]]; then
+      if (( have )) || [[ -n "$cur" ]]; then _out+=("$cur"); cur=""; have=0; fi
+    else
+      cur+="$c"
+    fi
+  done
+  if (( have )) || [[ -n "$cur" ]]; then _out+=("$cur"); fi
+}
+
+# Builds the browser command line for the app loaded in APP into the global
+# array ARGV. Dispatches to build_argv_<family>. With the argument "browser"
+# the chromium family opens the app URL in a normal browser window (toolbars,
+# extensions, settings) on the same profile instead of an app window.
+# Usage: build_argv [app|browser]
+ARGV=()
+build_argv() {
+  ARGV=()
+  local family="${APP[family]}" mode="${1:-app}"
+  case "$family" in
+    chromium|firefox|epiphany|falkon) "build_argv_$family" "$mode" ;;
+    *) die "$EX_ERROR" "app '${APP[id]}': unknown browser family '$family'" ;;
+  esac
+}
+
+# Global (config flags.<enum>) and per-app flags appended to every command line.
+append_extra_flags() {
+  split_flags ARGV "$(config_get "flags.${APP[browser]}")"
+  split_flags ARGV "${APP[flags]}"
+}
+
+build_argv_chromium() {
+  local id="${APP[id]}"
+  ARGV=("${APP[browser_exec]}"
+        "--user-data-dir=${APP[profile_dir]}"
+        "--profile-directory=${TOOL}-${id}"
+        --no-first-run --no-default-browser-check)
+  case "${APP[ozone]}" in
+    x11)     ARGV+=(--ozone-platform=x11 "--class=${TOOL}-${id}") ;;
+    wayland) ARGV+=(--ozone-platform=wayland) ;;
+    *)       ARGV+=(--ozone-platform-hint=auto) ;;
+  esac
+  append_extra_flags
+  if [[ "${1:-app}" == browser ]]; then
+    ARGV+=("${APP[url]}")
+  else
+    ARGV+=("--app=${APP[url]}")
+  fi
+}
+
+build_argv_firefox() {
+  local id="${APP[id]}"
+  ARGV=("${APP[browser_exec]}" --no-remote --profile "${APP[profile_dir]}"
+        --name "${TOOL}-${id}" --class "${TOOL}-${id}")
+  append_extra_flags
+  ARGV+=("${APP[url]}")
+}
+
+build_argv_epiphany() {
+  ARGV=("${APP[browser_exec]}" --application-mode "--profile=${APP[profile_dir]}")
+  append_extra_flags
+  ARGV+=("${APP[url]}")
+}
+
+build_argv_falkon() {
+  local id="${APP[id]}"
+  ARGV=("${APP[browser_exec]}" --no-remote "--profile=${TOOL}-${id}" "--wmclass=${TOOL}-${id}")
+  append_extra_flags
+  ARGV+=("${APP[url]}")
+}
+
+# Quotes one Exec= argument according to Desktop Entry Specification 1.5:
+#  1. '%' -> '%%' (field codes),
+#  2. arguments containing reserved characters are wrapped in double quotes
+#     with '"', '`', '$' and '\' escaped by a backslash,
+#  3. the generic string escaping is applied on top ('\' -> '\\').
+desktop_exec_quote() {
+  local a="$1"
+  a="${a//%/%%}"
+  if [[ "$a" == *[[:space:]\"\'\\\>\<\~\|\&\;\$\*\?\#\(\)\`]* || -z "$a" ]]; then
+    a="${a//\\/\\\\}"
+    a="${a//\"/\\\"}"
+    a="${a//\`/\\\`}"
+    a="${a//\$/\\\$}"
+    a="\"$a\""
+  fi
+  a="${a//\\/\\\\}"
+  printf '%s' "$a"
+}
+
+# Prints the Exec= value for ARGV. Control characters are stripped from every
+# argument, whatever its source (e.g. config flags.<enum>), so that Exec= always
+# stays a single line.
+desktop_exec_line() {
+  local out="" a
+  for a in "${ARGV[@]}"; do
+    out+="$(desktop_exec_quote "$(sanitize_line "$a")") "
+  done
+  printf '%s' "${out% }"
+}
+
+# Prints the full .desktop content for the app in APP (ARGV must be built).
+desktop_content() {
+  local icon="${APP[icon]}"
+  [[ -n "$icon" ]] || icon="applications-internet"
+  printf '[Desktop Entry]\n'
+  printf 'Type=Application\n'
+  printf 'Version=1.5\n'
+  printf 'Name=%s\n' "$(sanitize_line "${APP[name]}")"
+  printf 'Comment=Web app: %s\n' "$(sanitize_line "${APP[url]}")"
+  printf 'Exec=%s\n' "$(desktop_exec_line)"
+  printf 'Icon=%s\n' "$(sanitize_line "$icon")"
+  printf 'Terminal=false\n'
+  printf 'StartupNotify=true\n'
+  printf 'StartupWMClass=%s\n' "$(sanitize_line "${APP[wm_class]}")"
+  printf 'Categories=%s;\n' "$(sanitize_line "${APP[category]}")"
+  printf '%s-Id=%s\n' "$X_KEY_PREFIX" "${APP[id]}"
+  printf '%s-Browser=%s\n' "$X_KEY_PREFIX" "${APP[browser]}"
+}
+
+# Writes the .desktop file for APP, validates it when possible and refreshes
+# the menu. Prints the path.
+desktop_write() {
+  local file
+  file="$(desktop_file "${APP[id]}")"
+  build_argv
+  desktop_content | atomic_write "$file" || return 1
+  if has_cmd desktop-file-validate; then
+    desktop-file-validate "$file" >&2 || log_warn "desktop-file-validate reported problems for $file"
+  fi
+  log_debug "desktop: wrote $file"
+  printf '%s' "$file"
+}
+
+# Returns 0 when the file is a .desktop file generated by us for <id>.
+desktop_is_ours() {
+  local file="$1" id="$2"
+  [[ -f "$file" ]] && grep -qx -- "${X_KEY_PREFIX}-Id=${id}" "$file"
+}
+
+desktop_remove() {
+  local file
+  file="$(desktop_file "$1")"
+  if desktop_is_ours "$file" "$1"; then
+    rm -f -- "$file"
+  elif [[ -e "$file" ]]; then
+    log_warn "not removing $file: it was not generated by $TOOL"
+  fi
+}
+
+# Best-effort menu refresh (update-desktop-database, kbuildsycoca). Never fails.
+desktop_refresh() {
+  if has_cmd update-desktop-database; then
+    update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+  fi
+  if has_cmd kbuildsycoca6; then
+    kbuildsycoca6 >/dev/null 2>&1 || true
+  elif has_cmd kbuildsycoca5; then
+    kbuildsycoca5 >/dev/null 2>&1 || true
+  fi
+}
+
+# =============================================================================
+# Profiles
+# =============================================================================
+
+# Computes the profile directory (and, for Falkon, the symlink) for the browser
+# in BR_* and the given id. Sets PROFILE_PATH and PROFILE_LINK.
+PROFILE_PATH="" PROFILE_LINK=""
+profile_locate() {
+  local id="$1"
+  PROFILE_LINK=""
+  case "$BR_FAMILY" in
+    epiphany)
+      PROFILE_PATH="$PROFILES_DIR/org.gnome.Epiphany.WebApp_$id"
+      ;;
+    falkon)
+      PROFILE_PATH="$PROFILES_DIR/$id"
+      PROFILE_LINK="$XDG_CONFIG_HOME/falkon/profiles/${TOOL}-${id}"
+      ;;
+    *)
+      case "$BR_KIND" in
+        snap)    PROFILE_PATH="$HOME/snap/$BR_SNAP_NAME/common/${TOOL}-profiles/$id" ;;
+        flatpak) PROFILE_PATH="$HOME/.var/app/$BR_FLATPAK_ID/data/${TOOL}-profiles/$id" ;;
+        *)       PROFILE_PATH="$PROFILES_DIR/$id" ;;
+      esac
+      ;;
+  esac
+}
+
+# Creates the profile directory for the app in APP (family specific content).
+profile_create() {
+  local dir="${APP[profile_dir]}"
+  mkdir -p -- "$dir"
+  case "${APP[family]}" in
+    chromium)
+      # Suppresses the first-run UI; the profile itself is initialised by the browser.
+      : > "$dir/First Run"
+      ;;
+    firefox)
+      profile_write_firefox_template "$dir"
+      ;;
+    epiphany)
+      : > "$dir/.app"
+      if [[ -n "${APP[icon]}" && -f "${APP[icon]}" && "${APP[icon]}" == *.png ]]; then
+        cp -f -- "${APP[icon]}" "$dir/app-icon.png"
+      fi
+      ;;
+    falkon)
+      mkdir -p -- "$(dirname -- "${APP[profile_link]}")"
+      ln -sfn -- "$dir" "${APP[profile_link]}"
+      ;;
+  esac
+  log_debug "profile: created $dir"
+}
+
+# Epiphany recognises app mode by a copy of the .desktop file in the profile.
+profile_post_desktop() {
+  local desktop="$1"
+  if [[ "${APP[family]}" == epiphany && -d "${APP[profile_dir]}" ]]; then
+    cp -f -- "$desktop" "${APP[profile_dir]}/$(basename -- "$desktop")"
+  fi
+}
+
+# Removes the profile directory and the Falkon symlink of the app in APP.
+profile_delete() {
+  if [[ -n "${APP[profile_link]}" && -L "${APP[profile_link]}" ]]; then
+    rm -f -- "${APP[profile_link]}"
+  fi
+  if [[ -n "${APP[profile_dir]}" && -d "${APP[profile_dir]}" ]]; then
+    rm -rf -- "${APP[profile_dir]}"
+  fi
+}
+
+# Keeps the old profile of the app in APP when its browser changes. When the
+# new profile needs the same path, the old one is moved aside to
+# <path>.<timestamp>. The Falkon symlink of the old profile is removed: the
+# kept profile is a backup, no longer an active browser profile.
+# Usage: profile_move_aside <old-profile> <new-profile>
+profile_move_aside() {
+  local old="$1" new="$2" kept="$1"
+  if [[ "$new" == "$old" ]]; then
+    kept="$old.$(now_iso | tr -d ':')"
+    mv -- "$old" "$kept"
+  fi
+  log_info "old profile kept at $kept"
+  if [[ -n "${APP[profile_link]}" && -L "${APP[profile_link]}" ]]; then
+    rm -f -- "${APP[profile_link]}"
+  fi
+}
+
+# Firefox family: user.js (no first-run pages, userChrome enabled, native
+# window title bar) and a minimal, own userChrome.css that hides the toolbars
+# until the top edge of the window is hovered (Apache-2.0, written from
+# scratch; no third-party CSS is embedded).
+profile_write_firefox_template() {
+  local dir="$1"
+  mkdir -p -- "$dir/chrome"
+  cat > "$dir/user.js" <<'EOF'
+// Generated by fdwam. Web app profile.
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("datareporting.policy.firstRunURL", "");
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("browser.link.open_newwindow", 2);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.tabs.inTitlebar", 0);
+user_pref("browser.tabs.drawInTitlebar", false);
+EOF
+  cat > "$dir/chrome/userChrome.css" <<'EOF'
+/* Generated by fdwam. Hides the browser toolbars so that the window looks
+ * like a standalone app. Hovering the top edge of the window, or focusing
+ * the toolbar (Ctrl+L, Alt), shows them in full size over the page: tabs,
+ * address bar, extensions and the application menu. */
+@namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+/* Out of the layout flow: the page fills the window and the toolbars are
+ * drawn over it in their natural height. */
+#navigator-toolbox {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  z-index: 10 !important;
+  border-bottom: none !important;
+  background-color: var(--toolbox-bgcolor, Canvas) !important;
+}
+/* The hover strip along the top edge; the only part that reacts to the
+ * mouse while the toolbars are hidden. */
+#navigator-toolbox::before {
+  content: "" !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  height: 4px !important;
+  pointer-events: auto !important;
+}
+/* Hidden by opacity, not visibility: Firefox closes a menu or panel whose
+ * anchor button becomes invisible, so moving the mouse from the toolbar into
+ * an open menu would close it. pointer-events keeps the invisible toolbars
+ * from catching clicks meant for the page. The address bar and other
+ * popover elements are drawn in the top layer, which ignores the opacity of
+ * the toolbox, so they are listed too and also clipped away completely. */
+#navigator-toolbox:not(:hover):not(:focus-within),
+#navigator-toolbox:not(:hover):not(:focus-within) #urlbar,
+#navigator-toolbox:not(:hover):not(:focus-within) [popover] {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+#navigator-toolbox:not(:hover):not(:focus-within) #urlbar,
+#navigator-toolbox:not(:hover):not(:focus-within) [popover] {
+  clip-path: inset(50%) !important;
+}
+/* Keeps the toolbars visible while one of their menus or panels is open.
+ * Separate rule: a Firefox without :has() drops only this one. */
+:root #navigator-toolbox:has([open]),
+:root #navigator-toolbox:has([open]) #urlbar,
+:root #navigator-toolbox:has([open]) [popover] {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  clip-path: none !important;
+}
+/* #urlbar-container stayed faintly visible despite the rules above (Firefox
+ * on KDE), so it is removed from the layout while the toolbars are hidden.
+ * Not while a menu or panel is open, which would close the address bar
+ * panels; a Firefox without :has() drops this rule and shows a faint
+ * address bar instead. */
+#navigator-toolbox:not(:hover):not(:focus-within):not(:has([open])) #urlbar-container {
+  display: none !important;
+}
+:root[inDOMFullscreen] #navigator-toolbox {
+  visibility: hidden !important;
+}
+EOF
+}
+
+# =============================================================================
+# Icons and site metadata
+# =============================================================================
+
+# Downloads a URL to a file and prints the effective URL after redirects.
+# Uses curl, falls back to wget. Returns 1 on failure (no output).
+# Usage: http_fetch <url> <outfile>
+http_fetch() {
+  local url="$1" out="$2" eff
+  if has_cmd curl; then
+    eff="$(curl -fsSL --max-time 15 --retry 0 -A "$USER_AGENT" -o "$out" -w '%{url_effective}' -- "$url" 2>/dev/null)" || return 1
+    printf '%s' "${eff:-$url}"
+  elif has_cmd wget; then
+    wget -q -T 15 -t 1 -U "$USER_AGENT" -O "$out" -- "$url" 2>/dev/null || return 1
+    printf '%s' "$url"
+  else
+    log_warn "neither curl nor wget is available, cannot download $url"
+    return 1
+  fi
+}
+
+# Prints the value of attribute $2 inside an HTML tag $1 (double, single or no quotes).
+html_attr() {
+  printf '%s' "$1" | sed -nE "s/.*[[:space:]]${2}[[:space:]]*=[[:space:]]*(\"([^\"]*)\"|'([^']*)'|([^[:space:]>\"']+)).*/\2\3\4/Ip" | head -n1
+}
+
+# Numeric size from a sizes="WxH" attribute ("any" -> 1024, unknown -> 0).
+sizes_to_num() {
+  local s
+  s="$(lower "$1")"
+  if [[ "$s" == any ]]; then printf '1024'
+  elif [[ "$s" =~ ([0-9]+)x([0-9]+) ]]; then printf '%s' "${BASH_REMATCH[1]}"
+  else printf '0'; fi
+}
+
+# Result of site_fetch_metadata.
+META_NAME=""
+META_CANDIDATES=()   # lines "prio|size|label|url", sorted best first
+META_URL=""
+
+# Downloads the page and collects icon candidates and a suggested name.
+# Never fails; on network errors META_* stay empty except the /favicon.ico guess.
+# Usage: site_fetch_metadata <url>
+site_fetch_metadata() {
+  local url="$1" tmp html page eff tags tag rel href sizes size label
+  local manifest_url="" origin raw=()
+  META_NAME="" META_CANDIDATES=() META_URL="$url"
+  ensure_tmp
+  tmp="$TMP_ROOT"
+  page="$tmp/page.html"
+  if eff="$(http_fetch "$url" "$page")"; then
+    META_URL="$eff"
+    # Only the <head> matters; cap the size so huge pages stay cheap.
+    html="$(head -c 400000 "$page" | tr '\n\r\t' '   ')"
+    tags="$(printf '%s' "$html" | grep -oiE '<(link|meta)[[:space:]][^>]*>' || true)"
+    while IFS= read -r tag; do
+      [[ -n "$tag" ]] || continue
+      if [[ "$tag" =~ ^\<[Ll][Ii][Nn][Kk] ]]; then
+        rel="$(lower "$(html_attr "$tag" rel)")"
+        href="$(html_attr "$tag" href)"
+        [[ -n "$href" ]] || continue
+        sizes="$(html_attr "$tag" sizes)"
+        size="$(sizes_to_num "$sizes")"
+        case " $rel " in
+          *" manifest "*)
+            [[ -n "$manifest_url" ]] || manifest_url="$(url_resolve "$META_URL" "$href")" ;;
+          *" apple-touch-icon "*|*" apple-touch-icon-precomposed "*)
+            (( size > 0 )) || size=180
+            raw+=("2|$size|apple-touch-icon ${sizes:-180x180}|$(url_resolve "$META_URL" "$href")") ;;
+          *" icon "*)
+            [[ "$(lower "$href")" == *.svg* ]] && (( size < 1024 )) && size=1024
+            raw+=("3|$size|icon${sizes:+ $sizes}|$(url_resolve "$META_URL" "$href")") ;;
+        esac
+      else
+        if [[ -z "$META_NAME" && "$(lower "$(html_attr "$tag" property)")" == "og:site_name" ]]; then
+          META_NAME="$(html_unescape "$(html_attr "$tag" content)")"
+        fi
+      fi
+    done <<< "$tags"
+    if [[ -z "$META_NAME" ]]; then
+      while IFS= read -r tag; do
+        if [[ "$(lower "$(html_attr "$tag" name)")" == "application-name" ]]; then
+          META_NAME="$(html_unescape "$(html_attr "$tag" content)")"; break
+        fi
+      done <<< "$tags"
+    fi
+    if [[ -n "$manifest_url" ]]; then
+      manifest_collect "$manifest_url" raw
+    fi
+  else
+    log_warn "could not download $url (icon and name fall back to defaults)"
+  fi
+  origin="$(url_origin "$META_URL")"
+  raw+=("4|0|favicon.ico|$origin/favicon.ico")
+  META_NAME="$(trim "$(sanitize_line "$(html_unescape "$META_NAME")")")"
+  mapfile -t META_CANDIDATES < <(printf '%s\n' "${raw[@]}" | LC_ALL=C sort -t'|' -k1,1n -k2,2nr | awk -F'|' '!seen[$4]++')
+}
+
+# Parses a Web App Manifest and appends its icons (prio 1) to the array named
+# by $2. Also fills META_NAME from short_name/name when still empty.
+# Uses jq when available, otherwise a simple grep/sed parser.
+manifest_collect() {
+  local murl="$1" tmp file line src sizes size name
+  local -n _raw="$2"
+  ensure_tmp
+  tmp="$TMP_ROOT"
+  file="$tmp/manifest.json"
+  http_fetch "$murl" "$file" >/dev/null || return 0
+  if has_cmd jq; then
+    while IFS=$'\t' read -r src sizes; do
+      [[ -n "$src" ]] || continue
+      size="$(sizes_to_num "${sizes%% *}")"
+      _raw+=("1|$size|manifest ${sizes:-?}|$(url_resolve "$murl" "$src")")
+    done < <(jq -r '(.icons // [])[] | select(.src != null) | [.src, (.sizes // "")] | @tsv' "$file" 2>/dev/null || true)
+    if [[ -z "$META_NAME" ]]; then
+      name="$(jq -r '.short_name // .name // empty' "$file" 2>/dev/null || true)"
+      META_NAME="$name"
+    fi
+  else
+    # Fallback parser: one icon object per line, then pick "src" and "sizes".
+    while IFS= read -r line; do
+      src="$(printf '%s' "$line" | sed -nE 's/.*"src"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+      [[ -n "$src" ]] || continue
+      sizes="$(printf '%s' "$line" | sed -nE 's/.*"sizes"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+      size="$(sizes_to_num "${sizes%% *}")"
+      _raw+=("1|$size|manifest ${sizes:-?}|$(url_resolve "$murl" "$src")")
+    done < <(tr -d '\n\r' < "$file" | grep -oE '\{[^{}]*"src"[^{}]*\}' || true)
+    if [[ -z "$META_NAME" ]]; then
+      name="$(tr -d '\n\r' < "$file" | sed -nE 's/.*"short_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+      [[ -n "$name" ]] || name="$(tr -d '\n\r' < "$file" | sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+      META_NAME="$name"
+    fi
+  fi
+}
+
+# Detects an image type from magic bytes: png ico svg jpeg gif webp bmp unknown.
+image_type() {
+  local file="$1" hex
+  [[ -s "$file" ]] || { printf 'unknown'; return; }
+  hex="$(od -An -tx1 -N12 -- "$file" | tr -d ' \n')"
+  case "$hex" in
+    89504e470d0a1a0a*) printf 'png' ;;
+    ffd8ff*)           printf 'jpeg' ;;
+    474946383*)        printf 'gif' ;;
+    00000100*)         printf 'ico' ;;
+    52494646????????57454250) printf 'webp' ;;
+    424d*)             printf 'bmp' ;;
+    *)
+      if head -c 4096 -- "$file" | grep -qi '<svg'; then printf 'svg'
+      elif has_cmd file; then
+        case "$(file -b --mime-type -- "$file")" in
+          image/png) printf 'png' ;;
+          image/svg+xml) printf 'svg' ;;
+          image/x-icon|image/vnd.microsoft.icon) printf 'ico' ;;
+          *) printf 'unknown' ;;
+        esac
+      else printf 'unknown'; fi
+      ;;
+  esac
+}
+
+# ImageMagick front-ends (IM7 `magick`, IM6 `convert`/`identify`). Empty when missing.
+im_convert_cmd() { type -P magick || type -P convert || true; }
+im_identify_cmd() {
+  if type -P magick >/dev/null; then printf 'magick identify'
+  elif type -P identify >/dev/null; then printf 'identify'; fi
+}
+
+# Converts a raster image (ico/jpeg/gif/webp/bmp) to PNG (max 256x256, never
+# upscaled). ICO: the largest layer is used. The format is passed explicitly
+# ("ico:file") because the temp file has no extension and the ICO magic bytes
+# are too weak for ImageMagick's own detection. Returns 1 without a converter.
+image_to_png() {
+  local in="$1" out="$2" type="$3" conv ident idx=0 best=0 i w rest
+  conv="$(im_convert_cmd)"
+  [[ -n "$conv" ]] || return 1
+  if [[ "$type" == ico ]]; then
+    ident="$(im_identify_cmd)"
+    i=0
+    while read -r w rest; do
+      [[ "$w" =~ ^[0-9]+$ ]] || continue
+      if (( w > best )); then best=$w; idx=$i; fi
+      i=$((i + 1))
+    done < <($ident -format '%w\n' "${type}:${in}" 2>/dev/null || true)
+  fi
+  "$conv" "${type}:${in}[${idx}]" -background none -resize '256x256>' "png32:$out" >/dev/null 2>&1 || return 1
+  [[ -s "$out" ]]
+}
+
+# Fetches (or copies) an icon candidate and normalises it to PNG or SVG.
+# Prints the path of the normalised temp file; returns 1 when unusable.
+# Usage: icon_obtain <url-or-path>
+icon_obtain() {
+  local src="$1" tmp raw type out n
+  ensure_tmp
+  tmp="$TMP_ROOT"
+  n="$(( ${#META_CANDIDATES[@]} + RANDOM ))"
+  raw="$tmp/icon-raw-$n"
+  if [[ "$src" == *://* ]]; then
+    http_fetch "$src" "$raw" >/dev/null || { log_debug "icon: download failed: $src"; return 1; }
+  else
+    [[ -f "$src" ]] || { log_debug "icon: file not found: $src"; return 1; }
+    cp -f -- "$src" "$raw"
+  fi
+  type="$(image_type "$raw")"
+  case "$type" in
+    png) out="$tmp/icon-$n.png"; mv -f -- "$raw" "$out" ;;
+    svg) out="$tmp/icon-$n.svg"; mv -f -- "$raw" "$out" ;;
+    ico|jpeg|gif|webp|bmp)
+      out="$tmp/icon-$n.png"
+      if ! image_to_png "$raw" "$out" "$type"; then
+        log_debug "icon: cannot convert $type without ImageMagick: $src"
+        : > "$tmp/needs-converter"
+        return 1
+      fi
+      ;;
+    *) log_debug "icon: unsupported type '$type': $src"; return 1 ;;
+  esac
+  printf '%s' "$out"
+}
+
+# True when a previous icon_obtain skipped a candidate for lack of ImageMagick.
+icon_needed_converter() { [[ -n "$TMP_ROOT" && -e "$TMP_ROOT/needs-converter" ]]; }
+
+# Tries META_CANDIDATES in order and prints the path of the first usable icon
+# (temp file). Returns 1 when none works.
+icon_pick_best() {
+  local line url path
+  for line in "${META_CANDIDATES[@]}"; do
+    url="${line##*|}"
+    if path="$(icon_obtain "$url")"; then
+      log_debug "icon: using $url"
+      printf '%s' "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True when <url> is an icon candidate found on the page (META_CANDIDATES) and
+# was not given on the command line, i.e. an automatic favicon picked in the
+# wizard. Only those fall back softly when they cannot be used.
+icon_is_page_candidate() {
+  local line
+  [[ -z "${W_SET[icon]:-}" ]] || return 1
+  for line in "${META_CANDIDATES[@]}"; do
+    [[ "${line##*|}" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# Exits with an error for an explicit icon that icon_obtain could not use.
+die_icon_unusable() {
+  if icon_needed_converter; then
+    die "$EX_ERROR" "could not use icon '$1': install ImageMagick to convert ICO/WebP/JPEG icons, or pass a PNG/SVG"
+  fi
+  die "$EX_ERROR" "could not use icon '$1'"
+}
+
+# Installs a normalised temp icon as icons/<id>.<ext>. Prints the final path.
+icon_install() {
+  local src="$1" id="$2" ext dest
+  ext="${src##*.}"
+  mkdir -p -- "$ICON_DIR"
+  dest="$ICON_DIR/$id.$ext"
+  rm -f -- "$ICON_DIR/$id.png" "$ICON_DIR/$id.svg"
+  cp -f -- "$src" "$dest"
+  chmod 0644 "$dest"
+  printf '%s' "$dest"
+}
+
+icon_remove() {
+  rm -f -- "$ICON_DIR/$1.png" "$ICON_DIR/$1.svg"
+}
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+usage_error() {
+  log_error "$*"
+  log_info "run '$TOOL help' for usage"
+  exit "$EX_USAGE"
+}
+
+# Splits "--opt=value" into "--opt" "value" for the option loops below.
+# Usage: eval "$(split_long_opt "$1")" is avoided; instead callers use
+# `set -- "${1%%=*}" "${1#*=}" "${@:2}"` when "$1" matches --*=*.
+
+# An icon source is a URL or an existing local file.
+icon_source_valid() { [[ "$1" == *://* || -f "$1" ]]; }
+
+# Extra browser flags may only contain printable characters and spaces.
+flags_valid() { [[ "$1" != *[[:cntrl:]]* ]]; }
+
+# Validates and canonicalises a category list ("Network" or "Network;Office").
+category_valid() {
+  local v="${1%;}"
+  [[ "$v" =~ ^[A-Za-z][A-Za-z0-9-]*(\;[A-Za-z][A-Za-z0-9-]*)*$ ]] || return 1
+  printf '%s' "$v"
+}
+
+# Wizard/create state. W holds the chosen values, W_SET marks values that came
+# from arguments (the wizard skips those steps).
+declare -gA W=() W_SET=()
+
+# Fills defaults for every unset value in W: browser, id, name, category,
+# ozone, icon candidates. Downloads site metadata unless the call is offline
+# (--name together with --no-icon or a local --icon file).
+# Usage: create_defaults [quiet]
+create_defaults() {
+  local slug
+  if [[ -z "${W[browser]:-}" ]]; then
+    browser_default || exit "$EX_NO_BROWSER"
+    W[browser]="$BR_ENUM"
+  else
+    browser_resolve "${W[browser]}" || exit "$?"
+  fi
+  slug="$(slug_from_url "${W[url]}")"
+  if [[ -z "${W[id]:-}" ]]; then
+    W[id]="$(id_unique "$slug")"
+  fi
+  if create_needs_metadata; then
+    log_info "Fetching site metadata for ${W[url]}…"
+    site_fetch_metadata "${W[url]}"
+  else
+    META_NAME="" META_CANDIDATES=()
+  fi
+  if [[ -z "${W[name]:-}" ]]; then
+    W[name]="${META_NAME:-$(titleize "$slug")}"
+  fi
+  [[ -n "${W[category]:-}" ]] || W[category]="$(config_get default_category Network)"
+  [[ -n "${W[ozone]:-}" ]] || W[ozone]="$(ozone_default)"
+  [[ -v "W[flags]" ]] || W[flags]=""
+  [[ -v "W[icon]" ]] || W[icon]=""        # "" = auto (best candidate), "-" = generic/no icon
+}
+
+# True when the page must be downloaded: the name is missing, or the icon is
+# "auto" (empty, i.e. the favicon has to be found). With --name and --no-icon,
+# a local --icon file or an --icon URL nothing is taken from the page.
+create_needs_metadata() {
+  [[ -z "${W[name]:-}" || -z "${W[icon]:-}" ]]
+}
+
+# Copies W into APP (without side effects) so that Exec= can be previewed.
+wizard_fill_app() {
+  local key
+  APP=()
+  for key in "${REG_FIELDS[@]}"; do APP["$key"]=""; done
+  APP[id]="${W[id]}"
+  APP[name]="${W[name]}"
+  APP[url]="${W[url]}"
+  APP[browser]="$BR_ENUM"
+  APP[browser_kind]="$BR_KIND"
+  APP[browser_exec]="$BR_EXEC"
+  APP[family]="$BR_FAMILY"
+  profile_locate "${W[id]}"
+  APP[profile_dir]="$PROFILE_PATH"
+  APP[profile_link]="$PROFILE_LINK"
+  APP[ozone]="${W[ozone]}"
+  APP[category]="${W[category]}"
+  APP[flags]="${W[flags]}"
+  APP[wm_class]="$(compute_wm_class "$BR_FAMILY" "$BR_PREFIX" "${W[ozone]}" "${W[url]}" "${W[id]}")"
+}
+
+# Resolves the icon selection in W[icon] into an installed icon path in APP[icon].
+# "" = best candidate, "-" = generic icon, otherwise a path or URL. Only the
+# automatic favicon (and a page candidate picked in the wizard) falls back to
+# the generic icon; an explicit path or URL that cannot be used is an error.
+resolve_icon_into_app() {
+  local tmp_icon=""
+  ensure_tmp
+  rm -f -- "$TMP_ROOT/needs-converter"
+  case "${W[icon]}" in
+    -) APP[icon]="" ;;
+    "")
+      if tmp_icon="$(icon_pick_best)"; then
+        APP[icon]="$(icon_install "$tmp_icon" "${APP[id]}")"
+      else
+        APP[icon]=""
+        if icon_needed_converter; then
+          log_warn "no usable icon found: install ImageMagick to convert ICO/WebP/JPEG favicons, or pass --icon PATH|URL. Using a generic icon."
+        else
+          log_warn "no usable icon found for ${APP[url]}; using a generic icon (pass --icon PATH|URL to set one)."
+        fi
+      fi
+      ;;
+    *)
+      if tmp_icon="$(icon_obtain "${W[icon]}")"; then
+        APP[icon]="$(icon_install "$tmp_icon" "${APP[id]}")"
+      elif icon_is_page_candidate "${W[icon]}"; then
+        APP[icon]=""
+        log_warn "could not use icon '${W[icon]}'; using a generic icon."
+      else
+        die_icon_unusable "${W[icon]}"
+      fi
+      ;;
+  esac
+}
+
+# Writes everything for the app described by W: profile, icon, registry,
+# .desktop. On any failure the EXIT trap rolls back what was written.
+create_commit() {
+  local desktop now p
+  wizard_fill_app
+  CREATE_IN_PROGRESS=1
+  # Only paths that do not exist yet: a rollback must never delete foreign files.
+  ROLLBACK_PATHS=()
+  for p in "$(registry_file "${APP[id]}")" "$(desktop_file "${APP[id]}")" \
+           "$ICON_DIR/${APP[id]}.png" "$ICON_DIR/${APP[id]}.svg"; do
+    [[ -e "$p" || -L "$p" ]] || ROLLBACK_PATHS+=("$p")
+  done
+  [[ -e "${APP[profile_dir]}" ]] || ROLLBACK_PATHS+=("${APP[profile_dir]}")
+  [[ -z "${APP[profile_link]}" || -e "${APP[profile_link]}" ]] || ROLLBACK_PATHS+=("${APP[profile_link]}")
+  now="$(now_iso)"
+  APP[created]="$now"
+  APP[modified]="$now"
+  resolve_icon_into_app
+  profile_create
+  registry_write
+  desktop="$(desktop_write)" || exit "$?"
+  profile_post_desktop "$desktop"
+  desktop_refresh
+  CREATE_IN_PROGRESS=0
+  ROLLBACK_PATHS=()
+  say "Created '${APP[id]}' -> $desktop"
+}
+
+# fdwam create [<url>] [<browser>] [options]
+cmd_create() {
+  local interactive=0 launch=0 positional=()
+  W=() W_SET=()
+  while (( $# )); do
+    [[ "$1" == --*=* ]] && set -- "${1%%=*}" "${1#*=}" "${@:2}"
+    case "$1" in
+      --name)     [[ $# -ge 2 ]] || usage_error "--name requires a value"; W[name]="$(sanitize_line "$2")"; W_SET[name]=1; shift 2 ;;
+      --id)       [[ $# -ge 2 ]] || usage_error "--id requires a value"; W[id]="$2"; W_SET[id]=1; shift 2 ;;
+      --icon)     [[ $# -ge 2 ]] || usage_error "--icon requires a value"; W[icon]="$2"; W_SET[icon]=1; shift 2 ;;
+      --no-icon)  W[icon]="-"; W_SET[icon]=1; shift ;;
+      --category) [[ $# -ge 2 ]] || usage_error "--category requires a value"; W[category]="$2"; W_SET[category]=1; shift 2 ;;
+      --flags)    [[ $# -ge 2 ]] || usage_error "--flags requires a value"; flags_valid "$2" || usage_error "--flags must not contain control characters"; W[flags]="$2"; W_SET[flags]=1; shift 2 ;;
+      --x11)      W[ozone]=x11; W_SET[ozone]=1; shift ;;
+      --wayland)  W[ozone]=wayland; W_SET[ozone]=1; shift ;;
+      -i|--interactive) interactive=1; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      --launch)   launch=1; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      -h|--help)  cmd_help create; return 0 ;;
+      --)         shift; positional+=("$@"); break ;;
+      -*)         usage_error "unknown option for create: $1" ;;
+      *)          positional+=("$1"); shift ;;
+    esac
+  done
+  (( ${#positional[@]} <= 2 )) || usage_error "too many arguments for create"
+  if (( ${#positional[@]} >= 1 )); then
+    W[url]="$(url_normalize "${positional[0]}")" || usage_error "invalid URL '${positional[0]}' (only http and https are supported)"
+    W_SET[url]=1
+  fi
+  if (( ${#positional[@]} == 2 )); then
+    browser_is_enum "${positional[1]}" || usage_error "unknown browser '${positional[1]}' (expected one of: ${BROWSER_ENUM[*]})"
+    W[browser]="${positional[1]}"; W_SET[browser]=1
+  fi
+  if [[ -n "${W[id]:-}" ]]; then
+    id_valid "${W[id]}" || usage_error "invalid id '${W[id]}' (expected ${ID_REGEX})"
+    id_available "${W[id]}" || usage_error "$ID_TAKEN_REASON"
+  fi
+  if [[ -n "${W[icon]:-}" && "${W[icon]}" != "-" ]]; then
+    icon_source_valid "${W[icon]}" || usage_error "icon file not found: ${W[icon]}"
+  fi
+  if [[ -n "${W[category]:-}" ]]; then
+    W[category]="$(category_valid "${W[category]}")" || usage_error "invalid category '${W[category]}'"
+  fi
+  config_load
+
+  if (( ! interactive )) && [[ -z "${W[url]:-}" ]]; then
+    if is_interactive; then interactive=1
+    else usage_error "missing <url> (the interactive wizard needs a terminal)"; fi
+  fi
+
+  if (( interactive )); then
+    wizard_create "$launch"
+    return 0
+  fi
+
+  create_defaults
+  create_commit
+  if (( launch )); then
+    cmd_launch "${APP[id]}"
+  fi
+}
+
+# fdwam list [--long]
+cmd_list() {
+  local long=0 id ids=() w_id=2 w_name=4 w_browser=7 w_kind=4
+  while (( $# )); do
+    case "$1" in
+      -l|--long) long=1; shift ;;
+      -h|--help) cmd_help list; return 0 ;;
+      *) usage_error "unknown option for list: $1" ;;
+    esac
+  done
+  mapfile -t ids < <(registry_list)
+  if (( ${#ids[@]} == 0 )); then
+    log_info "no web apps yet (create one with: $TOOL create <url>)"
+    return 0
+  fi
+  for id in "${ids[@]}"; do
+    registry_read "$id" >/dev/null || continue
+    (( ${#id} > w_id )) && w_id=${#id}
+    (( ${#APP[name]} > w_name )) && w_name=${#APP[name]}
+    (( ${#APP[browser]} > w_browser )) && w_browser=${#APP[browser]}
+    (( ${#APP[browser_kind]} > w_kind )) && w_kind=${#APP[browser_kind]}
+  done
+  if (( long )); then
+    printf "%-${w_id}s  %-${w_name}s  %-${w_browser}s  %-${w_kind}s  %s\n" ID NAME BROWSER KIND URL
+  else
+    printf "%-${w_id}s  %-${w_name}s  %-${w_browser}s  %s\n" ID NAME BROWSER URL
+  fi
+  for id in "${ids[@]}"; do
+    registry_read "$id" >/dev/null || continue
+    if (( long )); then
+      printf "%-${w_id}s  %-${w_name}s  %-${w_browser}s  %-${w_kind}s  %s\n" "$id" "${APP[name]}" "${APP[browser]}" "${APP[browser_kind]}" "${APP[url]}"
+      printf "%-${w_id}s  wm_class: %s\n" "" "${APP[wm_class]}"
+      printf "%-${w_id}s  profile:  %s\n" "" "${APP[profile_dir]}"
+    else
+      printf "%-${w_id}s  %-${w_name}s  %-${w_browser}s  %s\n" "$id" "${APP[name]}" "${APP[browser]}" "${APP[url]}"
+    fi
+  done
+}
+
+# fdwam show <id>
+cmd_show() {
+  local id="${1:-}" key
+  [[ "$id" == -h || "$id" == --help ]] && { cmd_help show; return 0; }
+  [[ -n "$id" ]] || usage_error "show requires <id>"
+  registry_read "$id" || exit "$?"
+  config_load
+  for key in "${REG_FIELDS[@]}"; do
+    printf '%-13s %s\n' "$key:" "${APP[$key]}"
+  done
+  printf '%-13s %s\n' "desktop:" "$(desktop_file "$id")"
+  if in_list "${APP[family]}" chromium firefox epiphany falkon; then
+    build_argv
+    printf '%-13s %s\n' "exec:" "$(desktop_exec_line)"
+  else
+    printf '%-13s %s\n' "exec:" "(unknown browser family '${APP[family]}')"
+  fi
+}
+
+# Asks a yes/no question on the terminal. Returns 0 for yes.
+# Honours ASSUME_YES. On a non-terminal without -y returns 1.
+confirm() {
+  local prompt="$1" default="${2:-n}" reply
+  (( ASSUME_YES )) && return 0
+  is_interactive || return 1
+  if [[ "$default" == y ]]; then prompt+=" [Y/n]: "; else prompt+=" [y/N]: "; fi
+  printf '%s' "$prompt" >&2
+  IFS= read -r reply || return 1
+  reply="$(lower "$(trim "$reply")")"
+  [[ -z "$reply" ]] && reply="$default"
+  [[ "$reply" == y || "$reply" == yes ]]
+}
+
+# fdwam delete <id> [--keep-profile] [-y]
+cmd_delete() {
+  local id="" keep=0
+  while (( $# )); do
+    case "$1" in
+      --keep-profile) keep=1; shift ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      -h|--help) cmd_help delete; return 0 ;;
+      -*) usage_error "unknown option for delete: $1" ;;
+      *) [[ -z "$id" ]] || usage_error "too many arguments for delete"; id="$1"; shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || usage_error "delete requires <id>"
+  registry_read "$id" || exit "$?"
+  if (( ! keep )); then
+    if ! confirm "Delete '$id' including its browser profile (${APP[profile_dir]})?"; then
+      if is_interactive; then
+        log_info "not deleted"
+        return 0
+      fi
+      die "$EX_USAGE" "refusing to delete the browser profile of '$id' without confirmation (use -y, or --keep-profile)"
+    fi
+  fi
+  desktop_remove "$id"
+  icon_remove "$id"
+  if (( keep )); then
+    log_info "profile kept at ${APP[profile_dir]}"
+  else
+    profile_delete
+  fi
+  registry_delete "$id"
+  desktop_refresh
+  say "Deleted '$id'"
+}
+
+# fdwam launch <id> [--browser-mode]
+cmd_launch() {
+  local id="" mode=app
+  while (( $# )); do
+    case "$1" in
+      -b|--browser-mode) mode=browser; shift ;;
+      -h|--help) cmd_help launch; return 0 ;;
+      -*) usage_error "unknown option for launch: $1" ;;
+      *) [[ -z "$id" ]] || usage_error "launch takes a single <id>"; id="$1"; shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || usage_error "launch requires <id>"
+  registry_read "$id" || exit "$?"
+  if [[ "$mode" == browser ]]; then
+    case "${APP[family]}" in
+      chromium|falkon) ;;
+      firefox) die "$EX_ERROR" "--browser-mode is not needed for '${APP[browser]}': hover the top edge of the app window to show the toolbars" ;;
+      *) die "$EX_ERROR" "--browser-mode is not supported for '${APP[browser]}'" ;;
+    esac
+  fi
+  config_load
+  build_argv "$mode"
+  [[ -x "${ARGV[0]}" ]] || die "$EX_NO_BROWSER" "browser executable not found: ${ARGV[0]} (run '$TOOL regenerate $id' after reinstalling the browser)"
+  log_debug "launching: ${ARGV[*]}"
+  # exec replaces the process, so the EXIT trap never runs.
+  cleanup_tmp
+  exec "${ARGV[@]}"
+}
+
+# Re-detects the browser of APP and rewrites its .desktop file.
+regenerate_one() {
+  local id="${APP[id]}" desktop
+  if browser_resolve "${APP[browser]}"; then
+    if [[ "$BR_KIND" != "${APP[browser_kind]}" ]]; then
+      log_warn "$id: browser '${APP[browser]}' is now installed as $BR_KIND (was ${APP[browser_kind]}); the existing profile ${APP[profile_dir]} may be unreachable from the sandbox. Run '$TOOL modify $id --browser ${APP[browser]}' to create a fresh profile."
+    fi
+    APP[browser_exec]="$BR_EXEC"
+    APP[browser_kind]="$BR_KIND"
+  else
+    log_warn "$id: browser '${APP[browser]}' not found, keeping ${APP[browser_exec]}"
+    BR_PREFIX="${BROWSER_PREFIX[${APP[browser]}]:-${APP[browser]}}"
+  fi
+  APP[wm_class]="$(compute_wm_class "${APP[family]}" "$BR_PREFIX" "${APP[ozone]}" "${APP[url]}" "$id")"
+  registry_write
+  desktop="$(desktop_write)" || exit "$?"
+  profile_post_desktop "$desktop"
+  say "Regenerated '$id' -> $desktop"
+}
+
+# fdwam regenerate <id> | --all
+cmd_regenerate() {
+  local id="" all=0 ids=()
+  while (( $# )); do
+    case "$1" in
+      -a|--all) all=1; shift ;;
+      -h|--help) cmd_help regenerate; return 0 ;;
+      -*) usage_error "unknown option for regenerate: $1" ;;
+      *) id="$1"; shift ;;
+    esac
+  done
+  config_load
+  if (( all )); then
+    mapfile -t ids < <(registry_list)
+  elif [[ -n "$id" ]]; then
+    ids=("$id")
+  else
+    usage_error "regenerate requires <id> or --all"
+  fi
+  for id in "${ids[@]}"; do
+    registry_read "$id" || exit "$?"
+    regenerate_one
+  done
+  desktop_refresh
+}
+
+# fdwam modify <id> [options]
+cmd_modify() {
+  local id="" interactive=0 keep=0 changed=0 refresh_icon=0 new_browser="" new_url="" new_icon=""
+  local -A M=()
+  while (( $# )); do
+    [[ "$1" == --*=* ]] && set -- "${1%%=*}" "${1#*=}" "${@:2}"
+    case "$1" in
+      --name)     [[ $# -ge 2 ]] || usage_error "--name requires a value"; M[name]="$(sanitize_line "$2")"; shift 2 ;;
+      --url)      [[ $# -ge 2 ]] || usage_error "--url requires a value"; new_url="$2"; shift 2 ;;
+      --browser)  [[ $# -ge 2 ]] || usage_error "--browser requires a value"; new_browser="$2"; shift 2 ;;
+      --icon)     [[ $# -ge 2 ]] || usage_error "--icon requires a value"; new_icon="$2"; shift 2 ;;
+      --no-icon)  new_icon="-"; shift ;;
+      --refresh-icon) refresh_icon=1; shift ;;
+      --category) [[ $# -ge 2 ]] || usage_error "--category requires a value"; M[category]="$2"; shift 2 ;;
+      --flags)    [[ $# -ge 2 ]] || usage_error "--flags requires a value"; flags_valid "$2" || usage_error "--flags must not contain control characters"; M[flags]="$2"; shift 2 ;;
+      --x11)      M[ozone]=x11; shift ;;
+      --wayland)  M[ozone]=wayland; shift ;;
+      --keep-profile) keep=1; shift ;;
+      -i|--interactive) interactive=1; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      -h|--help)  cmd_help modify; return 0 ;;
+      -*)         usage_error "unknown option for modify: $1" ;;
+      *)          [[ -z "$id" ]] || usage_error "too many arguments for modify"; id="$1"; shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || usage_error "modify requires <id>"
+  registry_read "$id" || exit "$?"
+  config_load
+  (( ${#M[@]} > 0 )) || [[ -n "$new_url$new_browser$new_icon" ]] || (( refresh_icon )) && changed=1
+  if (( ! changed )); then
+    if (( interactive )) || is_interactive; then
+      wizard_modify "$keep"
+      return 0
+    fi
+    usage_error "modify: nothing to change (pass options, or run on a terminal for the wizard)"
+  fi
+  if [[ -n "$new_url" ]]; then
+    M[url]="$(url_normalize "$new_url")" || usage_error "invalid URL '$new_url' (only http and https are supported)"
+  fi
+  if [[ -v "M[category]" ]]; then
+    M[category]="$(category_valid "${M[category]}")" || usage_error "invalid category '${M[category]}'"
+  fi
+  if [[ -n "$new_browser" ]]; then
+    browser_is_enum "$new_browser" || usage_error "unknown browser '$new_browser' (expected one of: ${BROWSER_ENUM[*]})"
+  fi
+  if [[ -n "$new_icon" && "$new_icon" != "-" ]]; then
+    icon_source_valid "$new_icon" || usage_error "icon file not found: $new_icon"
+  fi
+  modify_apply M "$new_browser" "$new_icon" "$refresh_icon" "$keep"
+}
+
+# Applies changes to the loaded APP: the assoc array named by $1 holds plain
+# field changes (name, url, category, flags, ozone); $2 is a new browser enum
+# (or empty), $3 a new icon source ("" = unchanged, "-" = generic), $4 = 1 to
+# re-download the favicon, $5 = 1 to keep the old profile on browser change.
+modify_apply() {
+  local -n _m="$1"
+  local new_browser="$2" new_icon="$3" refresh_icon="$4" keep="$5" key desktop old_profile tmp_icon=""
+  # Validate all inputs before anything on disk is changed.
+  if [[ -n "$new_icon" && "$new_icon" != "-" ]] && (( ! refresh_icon )); then
+    ensure_tmp
+    rm -f -- "$TMP_ROOT/needs-converter"
+    if ! tmp_icon="$(icon_obtain "$new_icon")"; then
+      icon_is_page_candidate "$new_icon" || die_icon_unusable "$new_icon"
+      log_warn "could not use icon '$new_icon'; keeping the current icon"
+    fi
+  fi
+  if [[ -n "$new_browser" ]]; then
+    browser_resolve "$new_browser" || exit "$?"
+  fi
+  for key in name url category flags ozone; do
+    [[ -v "_m[$key]" ]] && APP["$key"]="${_m[$key]}"
+  done
+  if [[ -n "$new_browser" ]]; then
+    old_profile="${APP[profile_dir]}"
+    profile_locate "${APP[id]}"
+    if [[ "$BR_ENUM" != "${APP[browser]}" || "$BR_KIND" != "${APP[browser_kind]}" ]]; then
+      # Profiles are not portable between browsers: start a fresh one.
+      # profile_delete / profile_move_aside still see the old APP[profile_link].
+      if [[ -d "$old_profile" ]]; then
+        if (( keep )) || ! confirm "Browser changed: the old profile $old_profile cannot be reused. Delete it?"; then
+          profile_move_aside "$old_profile" "$PROFILE_PATH"
+        else
+          profile_delete
+        fi
+      fi
+      APP[profile_dir]="$PROFILE_PATH"
+      APP[profile_link]="$PROFILE_LINK"
+      APP[browser]="$BR_ENUM"
+      APP[browser_kind]="$BR_KIND"
+      APP[browser_exec]="$BR_EXEC"
+      APP[family]="$BR_FAMILY"
+      profile_create
+    else
+      APP[browser_exec]="$BR_EXEC"
+    fi
+  else
+    browser_resolve "${APP[browser]}" 2>/dev/null || BR_PREFIX="${BROWSER_PREFIX[${APP[browser]}]:-${APP[browser]}}"
+    if [[ -n "$BR_EXEC" && "$BR_KIND" == "${APP[browser_kind]}" ]]; then APP[browser_exec]="$BR_EXEC"; fi
+  fi
+  if (( refresh_icon )); then
+    log_info "Fetching site metadata for ${APP[url]}…"
+    site_fetch_metadata "${APP[url]}"
+    W[icon]=""
+    icon_remove "${APP[id]}"
+    resolve_icon_into_app
+  elif [[ "$new_icon" == "-" ]]; then
+    icon_remove "${APP[id]}"
+    APP[icon]=""
+  elif [[ -n "$tmp_icon" ]]; then
+    APP[icon]="$(icon_install "$tmp_icon" "${APP[id]}")"
+  fi
+  APP[wm_class]="$(compute_wm_class "${APP[family]}" "$BR_PREFIX" "${APP[ozone]}" "${APP[url]}" "${APP[id]}")"
+  APP[modified]="$(now_iso)"
+  registry_write
+  desktop="$(desktop_write)" || exit "$?"
+  profile_post_desktop "$desktop"
+  desktop_refresh
+  say "Updated '${APP[id]}' -> $desktop"
+}
+
+# fdwam browsers [--porcelain]
+cmd_browsers() {
+  local porcelain=0 enum status exec verified
+  while (( $# )); do
+    case "$1" in
+      --porcelain) porcelain=1; shift ;;
+      --table) shift ;;
+      -h|--help) cmd_help browsers; return 0 ;;
+      *) usage_error "unknown option for browsers: $1" ;;
+    esac
+  done
+  config_load
+  (( porcelain )) || printf '%-10s %-9s %-10s %-10s %-45s %s\n' BROWSER FAMILY SUPPORT INSTALL EXEC VERIFIED
+  for enum in "${BROWSER_ENUM[@]}"; do
+    if browser_resolve "$enum" 2>/dev/null; then status="$BR_KIND"; exec="$BR_EXEC"; else status="-"; exec="(not found)"; fi
+    verified="${BROWSER_VERIFIED[$enum]:-}"
+    if (( porcelain )); then
+      printf '%s|%s|%s|%s|%s|%s\n' "$enum" "${BROWSER_FAMILY[$enum]}" "${BROWSER_SUPPORT[$enum]}" "$status" "$exec" "$verified"
+    else
+      if [[ -n "$verified" ]]; then verified="verified: $verified"; else verified="unverified (wm_class rule estimated)"; fi
+      printf '%-10s %-9s %-10s %-10s %-45s %s\n' "$enum" "${BROWSER_FAMILY[$enum]}" "${BROWSER_SUPPORT[$enum]}" "$status" "$exec" "$verified"
+    fi
+  done
+}
+
+# fdwam doctor
+cmd_doctor() {
+  local problems=0 tool id f ids=() desk did
+  [[ "${1:-}" == -h || "${1:-}" == --help ]] && { cmd_help doctor; return 0; }
+  config_load
+  say "== Session"
+  say "  bash:            $BASH_VERSION"
+  say "  session type:    ${XDG_SESSION_TYPE:-unknown}${WAYLAND_DISPLAY:+ (WAYLAND_DISPLAY=$WAYLAND_DISPLAY)}"
+  say "  desktop:         ${XDG_CURRENT_DESKTOP:-unknown}"
+  say "  default ozone:   $(ozone_default)"
+  say "  data dir:        $DATA_DIR"
+  say "  config:          $CONFIG_FILE$( [[ -f "$CONFIG_FILE" ]] || printf ' (absent)')"
+  say "== Tools"
+  for tool in curl wget magick convert rsvg-convert file jq desktop-file-validate update-desktop-database kbuildsycoca6 kbuildsycoca5; do
+    if has_cmd "$tool"; then say "  [x] $tool"; else say "  [ ] $tool"; fi
+  done
+  if ! has_cmd curl && ! has_cmd wget; then say "  !! neither curl nor wget: favicons cannot be downloaded"; problems=1; fi
+  if ! has_cmd magick && ! has_cmd convert; then say "  !  ImageMagick missing: ICO/WebP/JPEG favicons are skipped (PNG/SVG still work)"; fi
+  say "== Browsers"
+  cmd_browsers --table | sed 's/^/  /'
+  say "== Apps"
+  mapfile -t ids < <(registry_list)
+  if (( ${#ids[@]} == 0 )); then say "  (none)"; fi
+  for id in "${ids[@]}"; do
+    registry_read "$id" >/dev/null || continue
+    say "  $id (${APP[browser]}, ${APP[browser_kind]})"
+    if [[ ! -x "${APP[browser_exec]}" ]]; then say "    !! browser executable missing: ${APP[browser_exec]} (run: $TOOL regenerate $id)"; problems=1; fi
+    f="$(desktop_file "$id")"
+    if ! desktop_is_ours "$f" "$id"; then say "    !! .desktop missing or foreign: $f (run: $TOOL regenerate $id)"; problems=1; fi
+    if [[ -n "${APP[icon]}" && ! -f "${APP[icon]}" ]]; then say "    !  icon file missing: ${APP[icon]} (run: $TOOL modify $id --refresh-icon)"; fi
+    if [[ ! -d "${APP[profile_dir]}" ]]; then say "    !  profile directory missing: ${APP[profile_dir]} (created on first launch)"; fi
+    say "    wm_class: ${APP[wm_class]}"
+  done
+  for desk in "$DESKTOP_DIR"/"$TOOL"-*.desktop; do
+    [[ -f "$desk" ]] || continue
+    did="$(sed -n "s/^${X_KEY_PREFIX}-Id=//p" "$desk" | head -n1)"
+    [[ -n "$did" ]] || continue
+    if ! registry_exists "$did"; then say "  !! orphan .desktop without registry entry: $desk (delete it manually)"; problems=1; fi
+  done
+  if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
+    say "== KDE hint"
+    say "  To compare the real app_id of a running window with the stored wm_class run:"
+    say "    qdbus6 org.kde.KWin /KWin org.kde.KWin.queryWindowInfo   (then click the window)"
+    say "  'resourceClass' must equal the wm_class above; if not, run '$TOOL regenerate --all' after fixing compute_wm_class, or use --x11."
+  fi
+  if (( problems )); then say "== Result: problems found"; return "$EX_ERROR"; fi
+  say "== Result: OK"
+}
+
+# =============================================================================
+# Interactive wizard
+# =============================================================================
+#
+# Prompts go to stderr, answers are read from stdin. On a terminal readline is
+# enabled (-e) and `modify` pre-fills the current value (-i). An empty answer
+# ALWAYS means the default, independent of the prefill, because tests feed
+# answers through a pipe where readline and -i are unavailable.
+
+# Reads one line. Usage: wizard_read <prompt> <prefill>; prints the answer,
+# returns 1 on EOF.
+wizard_read() {
+  local prompt="$1" prefill="$2" reply
+  if [[ -t 0 ]]; then
+    if [[ -n "$prefill" ]]; then
+      IFS= read -r -e -i "$prefill" -p "$prompt" reply || return 1
+    else
+      IFS= read -r -e -p "$prompt" reply || return 1
+    fi
+  else
+    printf '%s' "$prompt" >&2
+    IFS= read -r reply || { printf '\n' >&2; return 1; }
+  fi
+  printf '%s' "$reply"
+}
+
+# Asks for free text. Usage: prompt_text <label> <default> <validator> [prefill]
+# The validator prints the canonical value and returns 0, or prints a reason to
+# stderr and returns 1. Prints the final value; returns 1 on EOF.
+prompt_text() {
+  local label="$1" default="$2" validator="$3" prefill="${4:-}" reply canon prompt
+  while :; do
+    prompt="$label"
+    [[ -n "$default" ]] && prompt+=" [$default]"
+    prompt+=": "
+    reply="$(wizard_read "$prompt" "$prefill")" || return 1
+    [[ -t 0 ]] || printf '\n' >&2
+    reply="$(trim "$reply")"
+    [[ -n "$reply" ]] || reply="$default"
+    if [[ -z "$reply" ]]; then
+      log_info "  a value is required"
+      continue
+    fi
+    if [[ -n "$validator" ]]; then
+      if canon="$("$validator" "$reply")"; then printf '%s' "$canon"; return 0; fi
+      continue
+    fi
+    printf '%s' "$reply"
+    return 0
+  done
+}
+
+# Numbered choice. Usage: prompt_choice <label> <default-value> <options...>
+# Accepts a number or an option name (case-insensitive). Prints the option.
+prompt_choice() {
+  local label="$1" default="$2" opts=("${@:3}") i reply canon n
+  while :; do
+    log_info "$label"
+    for (( i = 0; i < ${#opts[@]}; i++ )); do
+      log_info "  $((i + 1))) ${opts[i]}"
+    done
+    reply="$(wizard_read "Choose [$default]: " "")" || return 1
+    [[ -t 0 ]] || printf '\n' >&2
+    reply="$(trim "$reply")"
+    [[ -n "$reply" ]] || reply="$default"
+    if [[ "$reply" =~ ^[0-9]+$ ]]; then
+      n=$((reply))
+      if (( n >= 1 && n <= ${#opts[@]} )); then printf '%s' "${opts[n-1]}"; return 0; fi
+      log_info "  please choose 1-${#opts[@]}"
+      continue
+    fi
+    if canon="$(match_list "$reply" "${opts[@]}")"; then printf '%s' "$canon"; return 0; fi
+    for (( i = 0; i < ${#opts[@]}; i++ )); do
+      if [[ "$(lower "${opts[i]%% *}")" == "$(lower "$reply")" ]]; then printf '%s' "${opts[i]}"; return 0; fi
+    done
+    log_info "  '$reply' is not one of the options"
+  done
+}
+
+# --- validators (print canonical value, or reason to stderr) ----------------
+
+validate_url() {
+  local v
+  if v="$(url_normalize "$1")"; then printf '%s' "$v"; else log_info "  invalid URL '$1' (only http and https are supported)"; return 1; fi
+}
+validate_name() {
+  local v
+  v="$(trim "$(sanitize_line "$1")")"
+  [[ -n "$v" ]] || { log_info "  name must not be empty"; return 1; }
+  printf '%s' "$v"
+}
+validate_new_id() {
+  id_valid "$1" || { log_info "  invalid id '$1' (lowercase letters, digits and '-', max 40 chars)"; return 1; }
+  id_available "$1" || { log_info "  $ID_TAKEN_REASON"; return 1; }
+  printf '%s' "$1"
+}
+validate_category() {
+  local v n
+  if [[ "$1" =~ ^[0-9]+$ ]]; then
+    n=$(( $1 ))
+    (( n >= 1 && n <= ${#MAIN_CATEGORIES[@]} )) && { printf '%s' "${MAIN_CATEGORIES[n-1]}"; return 0; }
+  fi
+  if v="$(match_list "$1" "${MAIN_CATEGORIES[@]}")"; then printf '%s' "$v"; return 0; fi
+  log_info "  '$1' is not a main category (${MAIN_CATEGORIES[*]})"
+  return 1
+}
+validate_icon_source() {
+  icon_source_valid "$1" && { printf '%s' "$1"; return 0; }
+  log_info "  file not found: $1"
+  return 1
+}
+validate_ozone() {
+  local v
+  if v="$(match_list "$1" "${OZONE_MODES[@]}")"; then printf '%s' "$v"; return 0; fi
+  log_info "  expected one of: ${OZONE_MODES[*]}"
+  return 1
+}
+validate_flags() {
+  flags_valid "$1" || { log_info "  flags must not contain control characters"; return 1; }
+  printf '%s' "$1"
+}
+
+# --- steps -------------------------------------------------------------------
+# Each step reads W, asks, and writes W. MODE is "create" or "modify".
+WIZ_MODE=create
+WIZ_PREFILL=0   # 1 = pre-fill current value (modify on a terminal)
+
+wiz_prefill() { (( WIZ_PREFILL )) && printf '%s' "$1"; return 0; }
+
+step_url() {
+  local v
+  v="$(prompt_text "URL" "${W[url]:-}" validate_url "$(wiz_prefill "${W[url]:-}")")" || return 1
+  W[url]="$v"
+  log_info "  Fetching site metadata…"
+  site_fetch_metadata "${W[url]}"
+  log_info "  done"
+}
+
+step_browser() {
+  local lines=() line opts=() labels=() enum kind support label default="" i v
+  mapfile -t lines < <(browsers_installed)
+  (( ${#lines[@]} > 0 )) || die "$EX_NO_BROWSER" "no supported browser found (looked for: ${BROWSER_ENUM[*]})"
+  for line in "${lines[@]}"; do
+    IFS='|' read -r enum kind _ support <<< "$line"
+    label="$(printf '%-10s (%s%s)' "$enum" "$kind" "$([[ "$support" == secondary ]] && printf ', best effort')")"
+    opts+=("$enum"); labels+=("$label")
+  done
+  if [[ -n "${W[browser]:-}" ]] && in_list "${W[browser]}" "${opts[@]}"; then default="${W[browser]}"
+  elif v="$(config_get default_browser)" && [[ -n "$v" ]] && in_list "$v" "${opts[@]}"; then default="$v"
+  else default="${opts[0]}"; fi
+  for (( i = 0; i < ${#opts[@]}; i++ )); do [[ "${opts[i]}" == "$default" ]] && default="$((i + 1))"; done
+  v="$(prompt_choice "Browser:" "$default" "${labels[@]}")" || return 1
+  v="${v%% *}"
+  W[browser]="$v"
+  browser_resolve "$v" >/dev/null
+}
+
+step_name() {
+  local slug default v
+  slug="$(slug_from_url "${W[url]}")"
+  default="${W[name]:-${META_NAME:-$(titleize "$slug")}}"
+  v="$(prompt_text "Name" "$default" validate_name "$(wiz_prefill "${W[name]:-}")")" || return 1
+  W[name]="$v"
+}
+
+step_id() {
+  local default v
+  default="${W[id]:-$(id_unique "$(slug_from_url "${W[url]}")")}"
+  v="$(prompt_text "ID" "$default" validate_new_id)" || return 1
+  W[id]="$v"
+}
+
+step_category() {
+  local default v
+  default="${W[category]:-$(config_get default_category Network)}"
+  v="$(prompt_text "Category ($(IFS=,; printf '%s' "${MAIN_CATEGORIES[*]}" | sed 's/,/, /g'))" "$default" validate_category)" || return 1
+  W[category]="$v"
+}
+
+step_icon() {
+  local opts=() line label url v n default=1 custom
+  if [[ "$WIZ_MODE" == modify && -n "${APP[icon]:-}" ]]; then
+    opts+=("keep current icon (${APP[icon]})")
+  fi
+  for line in "${META_CANDIDATES[@]}"; do
+    IFS='|' read -r _ _ label url <<< "$line"
+    opts+=("$label ($url)")
+  done
+  opts+=("custom path or URL" "generic icon")
+  if (( ${#opts[@]} == 2 )); then default=2; fi
+  if [[ "$WIZ_MODE" == modify ]]; then
+    # the current state is the default: keep the icon, or stay without one
+    if [[ -n "${APP[icon]:-}" ]]; then default=1; else default=${#opts[@]}; fi
+  fi
+  v="$(prompt_choice "Icon:" "$default" "${opts[@]}")" || return 1
+  n=0
+  for (( n = 0; n < ${#opts[@]}; n++ )); do [[ "${opts[n]}" == "$v" ]] && break; done
+  if [[ "$v" == "generic icon" ]]; then
+    W[icon]="-"
+  elif [[ "$v" == "custom path or URL" ]]; then
+    custom="$(prompt_text "Icon path or URL" "" validate_icon_source)" || return 1
+    W[icon]="$custom"
+  elif [[ "$v" == "keep current icon"* ]]; then
+    W[icon]="${APP[icon]}"
+  else
+    # candidate index = n minus the optional "keep" entry
+    [[ "${opts[0]}" == "keep current icon"* ]] && n=$((n - 1))
+    W[icon]="${META_CANDIDATES[n]##*|}"
+  fi
+}
+
+step_ozone() {
+  local v
+  [[ "$BR_FAMILY" == chromium ]] || return 0
+  v="$(prompt_text "Window mode ($(IFS=,; printf '%s' "${OZONE_MODES[*]}" | sed 's/,/, /g'))" "${W[ozone]:-$(ozone_default)}" validate_ozone)" || return 1
+  W[ozone]="$v"
+}
+
+step_flags() {
+  local v prompt="Extra browser flags"
+  (( WIZ_PREFILL )) && [[ -n "${W[flags]:-}" ]] && prompt+=" (Ctrl+U clears the current value)"
+  while :; do
+    v="$(wizard_read "$prompt [${W[flags]:-}]: " "$(wiz_prefill "${W[flags]:-}")")" || return 1
+    [[ -t 0 ]] || printf '\n' >&2
+    v="$(trim "$v")"
+    [[ -n "$v" ]] || v="${W[flags]:-}"
+    [[ "$v" == "-" ]] && v=""
+    validate_flags "$v" >/dev/null && break
+  done
+  W[flags]="$v"
+}
+
+# Prints the summary and asks for confirmation. Prints "yes", "no" or a step
+# number to edit.
+step_summary() {
+  local icon_desc reply
+  wizard_fill_app
+  case "${W[icon]}" in
+    -) icon_desc="generic (applications-internet)" ;;
+    "") icon_desc="best available favicon" ;;
+    *) icon_desc="${W[icon]}" ;;
+  esac
+  log_info ""
+  log_info "  Name      ${W[name]}"
+  log_info "  ID        ${W[id]}"
+  log_info "  URL       ${W[url]}"
+  log_info "  Browser   ${W[browser]} ($BR_EXEC, $BR_KIND)"
+  log_info "  Category  ${W[category]}"
+  log_info "  Icon      $icon_desc"
+  [[ "$BR_FAMILY" == chromium ]] && log_info "  Window    ${W[ozone]}"
+  [[ -n "${W[flags]}" ]] && log_info "  Flags     ${W[flags]}"
+  log_info "  Exec      $(build_argv; desktop_exec_line)"
+  while :; do
+    if [[ "$WIZ_MODE" == create ]]; then
+      reply="$(wizard_read "Create? [Y/n/e]: " "")" || return 1
+    else
+      reply="$(wizard_read "Save changes? [Y/n/e]: " "")" || return 1
+    fi
+    [[ -t 0 ]] || printf '\n' >&2
+    reply="$(lower "$(trim "$reply")")"
+    case "$reply" in
+      ""|y|yes) printf 'yes'; return 0 ;;
+      n|no) printf 'no'; return 0 ;;
+      e|edit)
+        reply="$(wizard_read "Edit step (1 URL, 2 browser, 3 name, 4 id, 5 category, 6 icon, 7 window mode, 8 flags): " "")" || return 1
+        [[ -t 0 ]] || printf '\n' >&2
+        reply="$(trim "$reply")"
+        if [[ "$reply" =~ ^[1-8]$ ]]; then printf '%s' "$reply"; return 0; fi
+        log_info "  expected a number 1-8"
+        ;;
+      *) log_info "  please answer y, n or e" ;;
+    esac
+  done
+}
+
+# Runs one step by number. Steps whose value came from the command line are
+# skipped on the first pass (unless forced).
+run_step() {
+  local n="$1" force="${2:-0}"
+  case "$n" in
+    1) (( force )) || [[ -z "${W_SET[url]:-}" ]] && { step_url || return 1; } ;;
+    2) (( force )) || [[ -z "${W_SET[browser]:-}" ]] && { step_browser || return 1; } ;;
+    3) (( force )) || [[ -z "${W_SET[name]:-}" ]] && { step_name || return 1; } ;;
+    4) [[ "$WIZ_MODE" == create ]] || return 0; (( force )) || [[ -z "${W_SET[id]:-}" ]] && { step_id || return 1; } ;;
+    5) (( force )) || [[ -z "${W_SET[category]:-}" ]] && { step_category || return 1; } ;;
+    6) (( force )) || [[ -z "${W_SET[icon]:-}" ]] && { step_icon || return 1; } ;;
+    7) (( force )) || [[ -z "${W_SET[ozone]:-}" ]] && { step_ozone || return 1; } ;;
+    8) (( force )) || [[ -z "${W_SET[flags]:-}" ]] && { step_flags || return 1; } ;;
+  esac
+  return 0
+}
+
+wizard_abort() {
+  log_info "aborted, nothing was written"
+  exit "$EX_ERROR"
+}
+
+# Interactive `create`. $1 = 1 when --launch was given.
+wizard_create() {
+  local launch="$1" n answer
+  WIZ_MODE=create WIZ_PREFILL=0
+  if [[ -n "${W_SET[url]:-}" ]]; then
+    log_info "  Fetching site metadata…"
+    site_fetch_metadata "${W[url]}"
+    log_info "  done"
+  else
+    META_NAME="" META_CANDIDATES=()
+  fi
+  # When the URL came from the command line the browser must still be resolved
+  # before step 2 is skipped.
+  if [[ -n "${W_SET[browser]:-}" ]]; then browser_resolve "${W[browser]}" || exit "$?"; fi
+  for n in 1 2 3 4 5 6 7 8; do
+    run_step "$n" || wizard_abort
+  done
+  [[ -n "${W[browser]:-}" ]] || { browser_default || exit "$EX_NO_BROWSER"; W[browser]="$BR_ENUM"; }
+  [[ -n "${W[ozone]:-}" ]] || W[ozone]="$(ozone_default)"
+  [[ -v "W[icon]" ]] || W[icon]=""
+  [[ -v "W[flags]" ]] || W[flags]=""
+  [[ -n "${W[category]:-}" ]] || W[category]="$(config_get default_category Network)"
+  while :; do
+    answer="$(step_summary)" || wizard_abort
+    case "$answer" in
+      yes) break ;;
+      no) log_info "not created"; exit 0 ;;
+      *) run_step "$answer" 1 || wizard_abort ;;
+    esac
+  done
+  create_commit
+  if (( launch )); then
+    cmd_launch "${APP[id]}"
+  fi
+  if confirm "Launch now?" n; then
+    cmd_launch "${APP[id]}"
+  fi
+}
+
+# Interactive `modify`: current values are the defaults. $1 = keep old profile.
+wizard_modify() {
+  local keep="$1" n answer new_browser="" new_icon="" key
+  local -A M=()
+  WIZ_MODE=modify
+  if [[ -t 0 ]]; then WIZ_PREFILL=1; else WIZ_PREFILL=0; fi
+  W=() W_SET=()
+  for key in url browser name id category icon ozone flags; do W["$key"]="${APP[$key]}"; done
+  W_SET[id]=1
+  browser_resolve "${APP[browser]}" >/dev/null 2>&1 || true
+  for n in 1 2 3 5 6 7 8; do
+    run_step "$n" || wizard_abort
+  done
+  while :; do
+    answer="$(step_summary)" || wizard_abort
+    case "$answer" in
+      yes) break ;;
+      no) log_info "no changes saved"; exit 0 ;;
+      4) log_info "  the ID cannot be changed" ;;
+      *) run_step "$answer" 1 || wizard_abort ;;
+    esac
+  done
+  # Translate W into modify_apply arguments.
+  registry_read "${W[id]}" >/dev/null
+  for key in name url category flags ozone; do
+    [[ "${W[$key]}" != "${APP[$key]}" ]] && M["$key"]="${W[$key]}"
+  done
+  [[ "${W[browser]}" != "${APP[browser]}" ]] && new_browser="${W[browser]}"
+  if [[ "${W[icon]}" != "${APP[icon]}" ]] && ! [[ "${W[icon]}" == "-" && -z "${APP[icon]}" ]]; then
+    new_icon="${W[icon]}"
+    [[ -z "$new_icon" ]] && new_icon="-"
+  fi
+  if (( ${#M[@]} == 0 )) && [[ -z "$new_browser$new_icon" ]]; then
+    log_info "nothing changed"
+    return 0
+  fi
+  modify_apply M "$new_browser" "$new_icon" 0 "$keep"
+}
+
+# =============================================================================
+# Help, version, main
+# =============================================================================
+
+cmd_version() {
+  say "$TOOL $FDWAM_VERSION, $FDWAM_LICENSE"
+}
+
+cmd_help() {
+  local topic="${1:-}"
+  case "$topic" in
+    create) cat <<EOF
+Usage: $TOOL create [<url>] [<browser>] [options]
+
+Creates a web app: an isolated browser profile, a downloaded favicon and a
+.desktop launcher in $DESKTOP_DIR.
+
+Without <url> on a terminal an interactive wizard asks for every value and
+offers defaults (Enter accepts the default). Arguments and options skip the
+corresponding questions; with -y everything else uses defaults.
+
+  <browser>           ${BROWSER_ENUM[*]}
+  --name NAME         application name (default: from the site, else from the host)
+  --id ID             launcher id (default: slug of the host, e.g. netflix)
+  --icon PATH|URL     icon file or URL instead of the favicon
+  --no-icon           use the generic theme icon, no download
+  --category CAT      menu category (default: Network)
+  --flags "ARGS"      extra browser arguments for this app
+  --x11 | --wayland   force the window backend (chromium family only)
+  -i, --interactive   run the wizard pre-filled with the given values
+  -y, --yes           never ask, use defaults
+  --launch            start the app after creating it
+
+Offline mode: --name together with --no-icon (or a local --icon file) makes
+create work without any network access. An explicit --icon must be usable:
+a missing file exits 2, a failed download or conversion exits 1.
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 unknown id, 4 browser not found.
+EOF
+      ;;
+    list) cat <<EOF
+Usage: $TOOL list [--long]
+
+Lists registered web apps (ID, NAME, BROWSER, URL). --long adds the
+installation kind, the window class and the profile directory.
+EOF
+      ;;
+    show) cat <<EOF
+Usage: $TOOL show <id>
+
+Prints the registry entry of an app, the path of its .desktop file and the
+exact command line that the launcher runs.
+EOF
+      ;;
+    modify) cat <<EOF
+Usage: $TOOL modify <id> [options]
+
+Changes an app and regenerates its .desktop file. Without options on a
+terminal the wizard runs with the current values as defaults.
+
+  --name NAME         new name
+  --url URL           new URL (recomputes StartupWMClass)
+  --browser BROWSER   new browser; the profile is not portable, so a new one is
+                      created and the old one deleted after confirmation
+  --keep-profile      keep the old profile when the browser changes
+  --icon PATH|URL     new icon         --no-icon      generic icon
+  --refresh-icon      download the favicon again
+  --category CAT      new category     --flags "ARGS" new extra flags
+  --x11 | --wayland   window backend (chromium family)
+  -i, --interactive   wizard pre-filled with the given values
+  -y, --yes           never ask
+EOF
+      ;;
+    delete) cat <<EOF
+Usage: $TOOL delete <id> [--keep-profile] [-y]
+
+Removes the .desktop file, the icon, the registry entry and the browser
+profile. The profile holds logins and cookies, so deleting it asks for
+confirmation; without a terminal -y is required.
+
+  --keep-profile      leave the profile directory in place
+  -y, --yes           do not ask
+EOF
+      ;;
+    launch) cat <<EOF
+Usage: $TOOL launch <id> [--browser-mode]
+
+Starts the app in the foreground with the browser's stderr visible (debugging).
+
+Options:
+  -b, --browser-mode  open the app URL in a normal browser window on the app's
+                      profile, to install extensions or change settings and
+                      site permissions (chromium family; works while the app
+                      is running)
+EOF
+      ;;
+    regenerate) cat <<EOF
+Usage: $TOOL regenerate <id> | --all
+
+Re-detects the browser binary, recomputes StartupWMClass and rewrites the
+.desktop file(s) from the registry. Run it after changing the config file or
+reinstalling a browser.
+EOF
+      ;;
+    browsers) cat <<EOF
+Usage: $TOOL browsers
+
+Shows how each supported browser was detected (native, snap, flatpak) and
+whether its window matching rule has been verified.
+EOF
+      ;;
+    doctor) cat <<EOF
+Usage: $TOOL doctor
+
+Checks the session, optional tools, installed browsers and every registered
+app (missing binaries, missing or orphaned .desktop files). Exit 1 when
+problems were found.
+EOF
+      ;;
+    ""|help) cat <<EOF
+$TOOL $FDWAM_VERSION – freedesktop web app manager
+
+Usage: $TOOL <command> [arguments]
+
+Commands:
+  create [<url>] [<browser>]  create a web app (interactive wizard without <url>)
+  list [--long]               list web apps
+  show <id>                   show details of a web app
+  modify <id> [options]       change a web app (wizard without options)
+  delete <id> [-y]            delete a web app and its profile
+  launch <id> [-b]            start a web app (-b: in a browser window)
+  regenerate <id>|--all       rewrite .desktop files from the registry
+  browsers                    show browser detection results
+  doctor                      diagnose the setup
+  help [command]              show help
+  version                     show version and license
+
+Browsers: ${BROWSER_ENUM[*]}
+Data:     $DATA_DIR
+Config:   $CONFIG_FILE
+EOF
+      ;;
+    *) usage_error "no help for '$topic'" ;;
+  esac
+}
+
+main() {
+  local cmd
+  install_traps
+  while (( $# )); do
+    case "$1" in
+      -v|--verbose) VERBOSE=1; shift ;;
+      -h|--help) cmd_help; return 0 ;;
+      -V|--version) cmd_version; return 0 ;;
+      --) shift; break ;;
+      -*) usage_error "unknown option: $1" ;;
+      *) break ;;
+    esac
+  done
+  (( $# )) || { cmd_help >&2; return "$EX_USAGE"; }
+  cmd="$1"; shift
+  case "$cmd" in
+    create|list|show|modify|delete|launch|regenerate|browsers|doctor|version)
+      "cmd_$cmd" "$@" ;;
+    help) cmd_help "${1:-}" ;;
+    *) usage_error "unknown command '$cmd'" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

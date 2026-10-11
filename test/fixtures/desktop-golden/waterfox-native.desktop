@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/waterfox --no-remote --profile @DATA@/fdwam/profiles/waterfox-app --name fdwam-waterfox-app --class fdwam-waterfox-app https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=fdwam-waterfox-app
+Categories=Network;
+X-Fdwam-Id=waterfox-app
+X-Fdwam-Browser=waterfox

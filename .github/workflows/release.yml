@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Lukáš Hornych
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.ref_name }}   # for the same branch
+  cancel-in-progress: false       # queue releases, never cancel one mid-publish
+
+permissions:
+  contents: write
+  # release-drafter reads merged pull requests to build the notes.
+  pull-requests: write
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history and tags: the version is resolved from the commits since the last tag.
+          fetch-depth: 0
+
+      # Conventional commits drive the version: a `!` marker or a `BREAKING CHANGE:` footer bumps
+      # the major, `feat:` the minor, everything else the patch.
+      - name: Resolve version
+        id: version
+        uses: codacy/git-version@2.7.1
+        with:
+          release-branch: 'main'
+          prefix: 'v'
+          # Single backslashes: YAML single quotes do not process escapes, so a doubled one
+          # reaches the regex as a literal backslash and stops `feat(scope):` from matching.
+          minor-identifier: '/feat(\([^)]+\))?:/'
+          # Lowercase only — the action downcases each line before matching, so an uppercase
+          # `BREAKING CHANGE` here could never fire. It also prepends `^` to this pattern and
+          # matches per line, which is why a footer on its own line counts. Types are listed rather
+          # than matched with \w+ so the marker cannot come from prose.
+          major-identifier: '/((feat|fix|refactor|perf|build|chore|docs|style|test|ci)(\([^)]+\))?!:|breaking[ -]change:)/'
+
+      # The assets are built from the resolved version; the tag is pushed before the release notes
+      # so the repository keeps the annotated tag rather than the lightweight one release-drafter
+      # would create as a side effect.
+      - name: Tag the resolved version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.version }}" -m "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - name: Draft the release notes
+        id: release
+        uses: release-drafter/release-drafter@v5
+        with:
+          version: ${{ steps.version.outputs.version }}
+          publish: true
+
+      # Same `make dist` as a developer would run locally: stamps the version into the script and
+      # writes SHA256SUMS, which install.sh verifies. `fdwam`, `fdwam.bash` and `SHA256SUMS` are the
+      # asset names install.sh downloads from releases/latest/download/.
+      - name: Build the release assets
+        run: make dist VERSION="${{ steps.version.outputs.version }}"
+
+      - name: Upload the assets to the published release
+        run: gh release upload "${{ steps.version.outputs.version }}" dist/fdwam dist/fdwam.bash dist/SHA256SUMS --clobber

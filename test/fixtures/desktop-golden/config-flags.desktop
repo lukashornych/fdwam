@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/brave --user-data-dir=@DATA@/fdwam/profiles/example --profile-directory=fdwam-example --no-first-run --no-default-browser-check --ozone-platform-hint=auto --enable-wayland-ime --force-dark-mode --kiosk --app=https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=brave-example.com__-fdwam-example
+Categories=Network;
+X-Fdwam-Id=example
+X-Fdwam-Browser=brave

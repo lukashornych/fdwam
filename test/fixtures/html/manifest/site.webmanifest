@@ -1,0 +1,8 @@
+{
+  "name": "Manifest Application",
+  "short_name": "ManiApp",
+  "icons": [
+    { "src": "small.png", "sizes": "48x48", "type": "image/png" },
+    { "src": "/manifest/big.png", "sizes": "192x192 512x512", "type": "image/png" }
+  ]
+}

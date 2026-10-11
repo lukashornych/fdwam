@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/zen-browser --no-remote --profile @DATA@/fdwam/profiles/zen-app --name fdwam-zen-app --class fdwam-zen-app https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=fdwam-zen-app
+Categories=Network;
+X-Fdwam-Id=zen-app
+X-Fdwam-Browser=zen

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/vivaldi-stable --user-data-dir=@DATA@/fdwam/profiles/vivaldi-app --profile-directory=fdwam-vivaldi-app --no-first-run --no-default-browser-check --ozone-platform-hint=auto --app=https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=vivaldi-example.com__-fdwam-vivaldi-app
+Categories=Network;
+X-Fdwam-Id=vivaldi-app
+X-Fdwam-Browser=vivaldi

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/falkon --no-remote --profile=fdwam-example --wmclass=fdwam-example https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=fdwam-example
+Categories=Network;
+X-Fdwam-Id=example
+X-Fdwam-Browser=falkon

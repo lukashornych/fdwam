@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/epiphany --application-mode --profile=@DATA@/fdwam/profiles/org.gnome.Epiphany.WebApp_example https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.gnome.Epiphany.WebApp_example
+Categories=Network;
+X-Fdwam-Id=example
+X-Fdwam-Browser=epiphany

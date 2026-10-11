@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Lukáš Hornych
+#
+# Minimal test image: Ubuntu 24.04 with only the mandatory runtime dependencies
+# of fdwam (bash, coreutils, curl) plus python3 for the local HTTP fixture server
+# and make for the `make dist` release test.
+# Verifies graceful degradation without ImageMagick, jq, file, gio and
+# desktop-file-validate.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bash coreutils curl ca-certificates python3 make \
+ && rm -rf /var/lib/apt/lists/* \
+ && if command -v gawk >/dev/null 2>&1; then echo "gawk must not be installed (KDE Neon ships mawk)" >&2; exit 1; fi \
+ && useradd -m -u 1001 -s /bin/bash tester \
+ && mkdir -p /tmp/home && chmod 1777 /tmp/home
+
+WORKDIR /src

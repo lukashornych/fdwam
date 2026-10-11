@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/librewolf --no-remote --profile @DATA@/fdwam/profiles/librewolf-app --name fdwam-librewolf-app --class fdwam-librewolf-app https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=fdwam-librewolf-app
+Categories=Network;
+X-Fdwam-Id=librewolf-app
+X-Fdwam-Browser=librewolf

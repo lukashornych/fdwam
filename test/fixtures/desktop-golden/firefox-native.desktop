@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Netflix
+Comment=Web app: https://www.netflix.com/
+Exec=@BIN@/firefox --no-remote --profile @DATA@/fdwam/profiles/netflix --name fdwam-netflix --class fdwam-netflix https://www.netflix.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=fdwam-netflix
+Categories=Network;
+X-Fdwam-Id=netflix
+X-Fdwam-Browser=firefox

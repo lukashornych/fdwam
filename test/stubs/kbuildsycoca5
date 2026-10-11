@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Lukáš Hornych
+# Test stub: records that kbuildsycoca5 was called (with its arguments) in $FDWAM_TEST_CALLS.
+printf '%s %s\n' "kbuildsycoca5" "$*" >> "${FDWAM_TEST_CALLS:-/dev/null}"
+exit 0

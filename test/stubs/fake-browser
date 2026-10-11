@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Lukáš Hornych
+#
+# Fake browser used by the tests. It is symlinked under real browser names
+# (brave, google-chrome-stable, firefox, ...). Every invocation records $0 (the
+# name it was started as) on the first line and then one argument per line in
+# $FDWAM_TEST_LOG, and exits successfully.
+: "${FDWAM_TEST_LOG:=/dev/null}"
+{
+  printf '%s\n' "$0"
+  printf '%s\n' "$@"
+} > "$FDWAM_TEST_LOG"
+exit 0

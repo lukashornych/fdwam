@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Example
+Comment=Web app: https://example.com/
+Exec=@BIN@/microsoft-edge-stable --user-data-dir=@DATA@/fdwam/profiles/edge-app --profile-directory=fdwam-edge-app --no-first-run --no-default-browser-check --ozone-platform-hint=auto --app=https://example.com/
+Icon=applications-internet
+Terminal=false
+StartupNotify=true
+StartupWMClass=msedge-example.com__-fdwam-edge-app
+Categories=Network;
+X-Fdwam-Id=edge-app
+X-Fdwam-Browser=edge
