@@ -83,8 +83,7 @@ regenerate ──► registry_read ──► browser_resolve ──► compute_w
 
 ## License boundaries
 
-The project is Apache-2.0. Linux Mint's webapp-manager is GPL-3.0: **no code
-may be copied from it**, only facts (binary names, flatpak ids, browser flags).
-The Firefox `userChrome.css` is written from scratch (MrOtherGuy's MPL-2.0 CSS
+The project is Apache-2.0: **no code may be copied from GPL-licensed
+projects**, only facts (binary names, flatpak ids, browser flags). The Firefox `userChrome.css` is written from scratch (MrOtherGuy's MPL-2.0 CSS
 is not used, because embedding it in the script would make the whole script a
 "Modification" under the MPL).

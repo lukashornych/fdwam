@@ -54,4 +54,4 @@ Development happens on `dev`; merges into `main` release automatically (`.github
 
 ## Licensing constraint
 
-Apache-2.0. Linux Mint's webapp-manager (GPL-3.0) may be used only for facts (binary names, flatpak ids, flags) — never copy its code. The Firefox `userChrome.css` is written from scratch; do not embed MPL-licensed CSS.
+Apache-2.0. GPL-licensed projects may be used only for facts (binary names, flatpak ids, flags) — never copy their code. The Firefox `userChrome.css` is written from scratch; do not embed MPL-licensed CSS.

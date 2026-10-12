@@ -20,10 +20,9 @@ that follows them: KDE Plasma, GNOME, Xfce, Cinnamon, …
 > fdwam is **not** an official freedesktop.org project and is not affiliated
 > with freedesktop.org in any way.
 
-Compared with Linux Mint's `webapp-manager`, fdwam has no GUI and no XApp or
-Python dependency, works on native Wayland (correct taskbar icon and window
-grouping on Plasma 6), handles snap and flatpak browsers, escapes `Exec=`
-correctly and keeps a registry so that launchers can be regenerated at any time.
+fdwam is a plain command-line tool without a GUI. It works on native Wayland
+(correct taskbar icon and window grouping on Plasma 6), handles snap and
+flatpak browsers, escapes `Exec=` correctly and keeps a registry so that launchers can be regenerated at any time.
 
 ## Quick start
 
@@ -347,10 +346,6 @@ Developers can also use `make install PREFIX=~/.local` / `make uninstall`.
 ## License and acknowledgements
 
 Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-
-Linux Mint's [webapp-manager](https://github.com/linuxmint/webapp-manager)
-inspired the isolated-profile approach and provided the list of browser
-binaries and flatpak IDs. No code from it is included.
 
 Developer documentation lives in [docs/dev/](docs/dev/). Development happens
 on the `dev` branch; merges into `main` are released automatically with a
